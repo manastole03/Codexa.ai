@@ -34,6 +34,19 @@ _Codexa.ai web app is a code editor that allows its users to collaborate and wri
 <br/>
 <br/>
 
+
+<img width="1919" height="910" alt="image" src="https://github.com/user-attachments/assets/4515ac6b-a541-441e-8edf-58ecd4adafcf" />
+
+<img width="1919" height="904" alt="image" src="https://github.com/user-attachments/assets/cdc76c83-1a51-4b66-a4a1-edfc70980620" />
+
+<img width="1919" height="904" alt="image" src="https://github.com/user-attachments/assets/5c6731ef-c246-4947-afd7-ef5868631d97" />
+
+<img width="1919" height="904" alt="image" src="https://github.com/user-attachments/assets/b3c2c5f3-beac-49cd-bcff-ada8b8b2a716" />
+
+<img width="1919" height="904" alt="image" src="https://github.com/user-attachments/assets/7dd5da6e-f65c-4cdb-87be-d27d79993fc0" />
+
+<img width="1919" height="907" alt="image" src="https://github.com/user-attachments/assets/3773b948-d5f9-4e39-82e5-e93c21cf09c8" />
+
 - - - -
 
 ## Getting Started with Create React App
