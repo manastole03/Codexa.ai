@@ -1,67 +1,31 @@
 {
-  "name": "realtime-code-editor",
-  "version": "0.1.0",
+  "name": "codexa-ai",
+  "version": "1.0.0",
   "private": true,
-  "dependencies": {
-    "@testing-library/jest-dom": "^5.16.4",
-    "@testing-library/react": "^12.1.4",
-    "@testing-library/user-event": "^13.5.0",
-    "codemirror": "^5.65.2",
-    "cors": "^2.8.5",
-    "dotenv": "^17.2.3",
-    "express": "^4.17.3",
-    "lucide-react": "^0.554.0",
-    "prismjs": "^1.30.0",
-    "react": "^18.0.0",
-    "react-dom": "^18.0.0",
-    "react-hot-toast": "^2.2.0",
-    "react-markdown": "^10.1.0",
-    "react-router-dom": "^6.3.0",
-    "react-scripts": "^5.0.1",
-    "recoil": "^0.7.0",
-    "remark-gfm": "^4.0.1",
-    "socket.io": "^4.4.1",
-    "socket.io-client": "^4.4.1",
-    "undici": "^7.16.0",
-    "uuid": "^8.3.2",
-    "web-vitals": "^2.1.4"
-  },
+  "packageManager": "pnpm@9.15.4",
   "scripts": {
-    "start": "react-scripts start",
-    "build": "react-scripts build",
-    "server:dev": "nodemon server.js",
-    "server:prod": "node server.js",
-    "test": "react-scripts test",
-    "eject": "react-scripts eject",
-    "dev": "vite",
-    "vite:build": "vite build",
-    "vite:preview": "vite preview"
-  },
-  "eslintConfig": {
-    "extends": [
-      "react-app",
-      "react-app/jest"
-    ]
-  },
-  "browserslist": {
-    "production": [
-      ">0.2%",
-      "not dead",
-      "not op_mini all"
-    ],
-    "development": [
-      "last 1 chrome version",
-      "last 1 firefox version",
-      "last 1 safari version"
-    ]
+    "dev": "turbo run dev --parallel",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "clean": "turbo run clean && rimraf node_modules",
+    "docker:up": "docker compose up -d postgres redis",
+    "docker:down": "docker compose down",
+    "docker:build-execs": "docker compose --profile executor-build build arena-node arena-python arena-cpp",
+    "db:push": "pnpm --filter @codexa/db db:push",
+    "db:seed": "pnpm --filter @codexa/db db:seed",
+    "dev:web": "pnpm --filter @codexa/web dev",
+    "dev:api": "pnpm --filter @codexa/api dev",
+    "dev:executor": "pnpm --filter @codexa/executor dev",
+    "dev:mcp": "pnpm --filter @codexa/mcp dev"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^4.7.0",
-    "nodemon": "^2.0.15",
-    "vite": "^5.4.21"
-  },
-  "overrides": {
-    "ajv": "6.12.6",
-    "ajv-keywords": "3.5.2"
+    "@types/node": "^20.17.14",
+    "eslint": "^8.57.1",
+    "prettier": "^3.4.2",
+    "rimraf": "^6.0.1",
+    "tsx": "^4.19.2",
+    "turbo": "^2.3.3",
+    "typescript": "^5.7.2"
   }
 }

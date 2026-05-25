@@ -1,0 +1,28 @@
+{
+  "name": "@codexa/executor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json --outDir dist",
+    "start": "node dist/index.js",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "@codexa/types": "workspace:*",
+    "bullmq": "^5.34.2",
+    "dockerode": "^4.0.2",
+    "dotenv": "^16.4.7",
+    "ioredis": "^5.4.2"
+  },
+  "devDependencies": {
+    "@codexa/config": "workspace:*",
+    "@types/dockerode": "^3.3.34",
+    "@types/node": "^20.17.14",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

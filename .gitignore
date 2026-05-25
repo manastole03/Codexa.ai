@@ -2,6 +2,7 @@
 
 # dependencies
 /node_modules
+**/node_modules
 /.pnp
 .pnp.js
 
@@ -10,9 +11,21 @@
 
 # production
 /build
+dist
+.next
+.turbo
+*.tsbuildinfo
+**/.next
+**/dist
+**/.turbo
+archive/legacy-vite/build
+archive/legacy-vite/dist
+archive/legacy-vite/.sessions
 
 # misc
 .env
+.env.*
+!.env.example
 .DS_Store
 .env.local
 .env.development.local

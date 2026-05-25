@@ -1,0 +1,30 @@
+{
+  "name": "@codexa/db",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/client.ts",
+  "types": "./src/client.ts",
+  "scripts": {
+    "build": "prisma generate && tsc -p tsconfig.json --noEmit false --emitDeclarationOnly --outDir dist",
+    "db:push": "prisma db push",
+    "db:seed": "tsx src/seed.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "eslint src --ext .ts",
+    "clean": "rimraf dist node_modules/.prisma"
+  },
+  "dependencies": {
+    "@codexa/problems": "workspace:*",
+    "@prisma/client": "^6.1.0",
+    "bcryptjs": "^2.4.3"
+  },
+  "devDependencies": {
+    "@codexa/config": "workspace:*",
+    "@types/bcryptjs": "^2.4.6",
+    "prisma": "^6.1.0",
+    "tsx": "^4.19.2"
+  },
+  "prisma": {
+    "seed": "tsx src/seed.ts"
+  }
+}

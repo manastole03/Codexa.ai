@@ -1,0 +1,11 @@
+{
+  "name": "@codexa/config",
+  "version": "1.0.0",
+  "private": true,
+  "files": [
+    "tsconfig.base.json",
+    "tsconfig.next.json",
+    "tailwind.preset.ts",
+    "eslint.base.cjs"
+  ]
+}

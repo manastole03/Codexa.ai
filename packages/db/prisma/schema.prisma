@@ -1,0 +1,249 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ProductKind {
+  COLLABORATIVE
+  ARENA
+}
+
+enum Difficulty {
+  EASY
+  MEDIUM
+  HARD
+}
+
+enum Language {
+  JAVASCRIPT
+  TYPESCRIPT
+  PYTHON
+  CPP
+  JAVA
+  GO
+  RUST
+  CSHARP
+  RUBY
+  PHP
+  SWIFT
+  KOTLIN
+  DART
+}
+
+enum SubmissionStatus {
+  PENDING
+  RUNNING
+  ACCEPTED
+  WRONG_ANSWER
+  RUNTIME_ERROR
+  TIME_LIMIT_EXCEEDED
+  MEMORY_LIMIT_EXCEEDED
+  COMPILE_ERROR
+  SYSTEM_ERROR
+}
+
+model User {
+  id            String       @id @default(cuid())
+  name          String?
+  email         String?      @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String?
+  accounts      Account[]
+  sessions      Session[]
+  rooms         RoomMember[]
+  submissions   Submission[]
+  messages      Message[]
+  badges        UserBadge[]
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model Problem {
+  id          String              @id @default(cuid())
+  slug        String              @unique
+  title       String
+  difficulty  Difficulty
+  tags        String[]
+  summary     String
+  statement   String             @db.Text
+  constraints String[]
+  hints       String[]
+  editorial   String             @db.Text
+  examples    ProblemExample[]
+  tests       TestCase[]
+  starters    StarterCode[]
+  solutions   ReferenceSolution[]
+  submissions Submission[]
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+}
+
+model ProblemExample {
+  id          String  @id @default(cuid())
+  problemId   String
+  order       Int
+  input       String  @db.Text
+  output      String  @db.Text
+  explanation String? @db.Text
+  problem     Problem @relation(fields: [problemId], references: [id], onDelete: Cascade)
+}
+
+model TestCase {
+  id         String  @id @default(cuid())
+  externalId String
+  problemId  String
+  input      String  @db.Text
+  expected   String  @db.Text
+  hidden     Boolean @default(false)
+  problem    Problem @relation(fields: [problemId], references: [id], onDelete: Cascade)
+}
+
+model StarterCode {
+  id        String   @id @default(cuid())
+  problemId String
+  language  Language
+  code      String   @db.Text
+  problem   Problem  @relation(fields: [problemId], references: [id], onDelete: Cascade)
+
+  @@unique([problemId, language])
+}
+
+model ReferenceSolution {
+  id        String   @id @default(cuid())
+  problemId String
+  language  Language
+  code      String   @db.Text
+  problem   Problem  @relation(fields: [problemId], references: [id], onDelete: Cascade)
+
+  @@unique([problemId, language])
+}
+
+model Room {
+  id          String      @id @default(cuid())
+  product     ProductKind
+  name        String
+  language    Language    @default(JAVASCRIPT)
+  problemSlug String?
+  members     RoomMember[]
+  messages    Message[]
+  submissions Submission[]
+  files       RoomFile[]
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+}
+
+model RoomFile {
+  id        String   @id @default(cuid())
+  roomId    String
+  name      String
+  language  Language @default(JAVASCRIPT)
+  content   String   @default("") @db.Text
+  order     Int      @default(0)
+  lockedBy  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@index([roomId, order])
+}
+
+model RoomMember {
+  id       String   @id @default(cuid())
+  roomId   String
+  userId   String?
+  name     String
+  socketId String?
+  joinedAt DateTime @default(now())
+  room     Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user     User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  roomId    String
+  userId    String?
+  author    String
+  body      String   @db.Text
+  createdAt DateTime @default(now())
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+}
+
+model Submission {
+  id          String           @id @default(cuid())
+  product     ProductKind
+  userId      String?
+  roomId      String?
+  problemId   String?
+  language    Language
+  status      SubmissionStatus @default(PENDING)
+  code        String           @db.Text
+  stdin       String?          @db.Text
+  results     Json?
+  runtimeMs   Int              @default(0)
+  memoryKb    Int?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  user        User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+  room        Room?            @relation(fields: [roomId], references: [id], onDelete: SetNull)
+  problem     Problem?         @relation(fields: [problemId], references: [id], onDelete: SetNull)
+}
+
+model Badge {
+  id          String      @id @default(cuid())
+  key         String      @unique
+  title       String
+  description String
+  users       UserBadge[]
+}
+
+model UserBadge {
+  id        String   @id @default(cuid())
+  userId    String
+  badgeId   String
+  awardedAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  badge     Badge    @relation(fields: [badgeId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, badgeId])
+}
