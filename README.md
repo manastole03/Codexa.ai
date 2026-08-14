@@ -1,359 +1,213 @@
-# Codexa.ai  🤖🤖
+# Codexa.ai
 
-> **Codexa.ai** is a realtime collaborative code editor for the web. Teams can create rooms, write code together with low latency, and switch between 63 editor themes and 21 language modes—right in the browser.
+Codexa.ai is a real-time collaborative engineering workspace for pair programming, coding interviews, competitive problem solving, and system design. It combines a VS Code-inspired editor, shared rooms, sandboxed code execution, live presence, chat, AI assistance, and collaborative diagrams in one pnpm monorepo.
 
-**Live App:** https://code-sync-qq8w.onrender.com/
+## Products
 
-![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white)
-![Node.js](https://img.shields.io/badge/Node.js-18+-339933?logo=node.js&logoColor=white)
-![Express](https://img.shields.io/badge/Express-4-black?logo=express&logoColor=white)
-![Socket.io](https://img.shields.io/badge/Socket.io-4-010101?logo=socketdotio&logoColor=white)
-![CodeMirror](https://img.shields.io/badge/CodeMirror-6-ff4785)
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+| Product | Route | What it provides |
+| --- | --- | --- |
+| Collaborative Coding | `/collaborative` | Multi-file shared editor, presence, chat, file search, terminal output, and room administration |
+| LeetCode Arena | `/arena` | Problem browser, Monaco editor, run/submit workflow, leaderboard-ready submissions, and timed battle mode |
+| System Design | `/system-design` | Collaborative architecture canvas, components and connections, simulation tools, and shared rooms |
 
----
+The home page at `/` is the product launcher.
 
-## Table of Contents
+## Highlights
 
-- [Features](#features)
-- [Tech Stack](#tech-stack)
-- [Architecture](#architecture)
-- [Screenshots](#screenshots)
-- [Getting Started](#getting-started)
-  - [Prerequisites](#prerequisites)
-  - [Local Development](#local-development)
-  - [Environment Variables](#environment-variables)
-  - [NPM Scripts](#npm-scripts)
-- [Docker (Optional)](#docker-optional)
-- [Production Build & Deployment](#production-build--deployment)
-- [Project Structure](#project-structure)
-- [Realtime Collaboration Model](#realtime-collaboration-model)
-- [Theme & Language Support](#theme--language-support)
-- [Security Notes](#security-notes)
-- [Troubleshooting](#troubleshooting)
-- [Roadmap](#roadmap)
-- [Contributing](#contributing)
-- [License](#license)
-
----
-
-## Features
-
-- ✅ **Realtime Collaborative Editing** powered by **Socket.io**
-- 🧠 **21 programming languages** with syntax highlighting (CodeMirror 6)
-- 🎨 **63 editor themes** (light/dark & high-contrast options)
-- 📱 **Responsive UI** across desktop/tablet/mobile
-- 🔁 **Room-based sessions** with presence indicators
-- 🔔 **Toasts & UX feedback** via `react-hot-toast`
-- 🔗 **Link sharing** to invite collaborators
-- ♻️ **State management** with Recoil
-- 🔐 **Environment-based config** for client/server
-
----
-
-## Screenshots
-
-<img width="1919" height="910" alt="image" src="https://github.com/user-attachments/assets/4515ac6b-a541-441e-8edf-58ecd4adafcf" />
-
-<img width="1919" height="904" alt="image" src="https://github.com/user-attachments/assets/cdc76c83-1a51-4b66-a4a1-edfc70980620" />
-
-<img width="1919" height="904" alt="image" src="https://github.com/user-attachments/assets/5c6731ef-c246-4947-afd7-ef5868631d97" />
-
-<img width="1919" height="904" alt="image" src="https://github.com/user-attachments/assets/b3c2c5f3-beac-49cd-bcff-ada8b8b2a716" />
-
-<img width="1919" height="904" alt="image" src="https://github.com/user-attachments/assets/7dd5da6e-f65c-4cdb-87be-d27d79993fc0" />
-
-<img width="1919" height="907" alt="image" src="https://github.com/user-attachments/assets/3773b948-d5f9-4e39-82e5-e93c21cf09c8" />
-
----
-
-## Tech Stack
-
-**Frontend**
-- React, Recoil
-- CodeMirror 6
-- react-router
-- axios
-- react-hot-toast
-
-**Backend**
-- Node.js (Express.js)
-- Socket.io (websockets)
-- (Stateless API; room/memory stored in-process or via adapter—see Docker notes)
-
----
+- Real-time rooms powered by Socket.IO, Yjs, and Monaco
+- Admin and participant roles with invitations, removals, room links, and room lifecycle controls
+- Persistent multi-file collaborative projects backed by PostgreSQL
+- Live cursor awareness, active-user presence, chat, file explorer, file search, and status bar
+- Coding Arena with curated problems, language starters, test execution, submissions, and editorials
+- Timed head-to-head battle rooms with countdowns, participant state, results, and code reveal
+- Collaborative system-design workspace with an Excalidraw-based canvas and simulation tools
+- AI pair-programming endpoints compatible with OpenRouter and OpenAI-style providers
+- BullMQ execution queue with Redis and Docker-isolated language runners
+- Optional local host-runtime fallback for development when executor images are unavailable
+- MCP server exposing problems, solutions, hints, editorials, and solution validation
+- Auth.js credentials and GitHub authentication with Prisma persistence
+- API hardening through validated configuration, CORS allowlists, Helmet, and rate limiting
 
 ## Architecture
 
 ```text
-client (React)
-├─ UI (React + Tailwind/ styles)
-├─ State (Recoil)
-├─ Editor (CodeMirror: languages/themes)
-└─ Socket client (join room, broadcast ops)
+Browser (Next.js + Monaco + Excalidraw)
+        │ HTTP / Socket.IO / Yjs
+        ▼
+API (Express + Socket.IO) ─────── PostgreSQL (Prisma)
+        │                               │
+        ├── Redis / BullMQ ───── Executor worker ───── Docker sandbox
+        │
+        └── OpenRouter-compatible AI provider
 
-server (Node + Express + Socket.io)
-├─ REST (health/config)
-├─ Socket namespace /rooms
-└─ Collaboration hub (broadcast edits, cursor, theme/lang)
+MCP clients ─────────────── MCP server ───────────── Problems package / API
 ```
 
-**Flow**
-1. User creates or joins a room.
-2. Client connects to Socket.io namespace with `roomId`.
-3. Client emits local changes; server broadcasts to other peers.
-4. Editor state updates in realtime for all clients.
+## Technology
 
----
+- Next.js 15, React 19, TypeScript, Tailwind CSS, and Framer Motion
+- Monaco Editor, Excalidraw, Yjs, Socket.IO, and Prism
+- Express, Zod, Helmet, and express-rate-limit
+- Auth.js, Prisma, and PostgreSQL
+- BullMQ, Redis, Dockerode, and Docker
+- Model Context Protocol TypeScript SDK
+- Turborepo and pnpm workspaces
 
-## Getting Started
-
-### Prerequisites
-- **Node.js** v18+ and **npm** v9+ (or **pnpm/yarn**)
-- **Git**
-- (Optional) **Docker** 24+
-
-### Local Development
-
-Clone and install:
-
-```bash
-git clone <your-repo-url> codexa.ai
-cd codexa.ai
-
-# install deps
-npm run install:all
-# or run separately:
-# (cd client && npm i) && (cd server && npm i)
-
-# start both client and server in dev
-npm run dev
-```
-
-**Frontend dev server:** `http://localhost:5173` (Vite default) or `http://localhost:3000` if CRA  
-**Backend server:** `http://localhost:4000`  
-**Socket endpoint:** `ws://localhost:4000` (path `/socket.io`)
-
-> If your ports differ, update the env files below.
-
-### Environment Variables
-
-Create **two** `.env` files using these examples.
-
-**`/client/.env`**
-```env
-# Vite-style env vars must start with VITE_
-VITE_APP_NAME=Codexa.ai
-VITE_API_BASE_URL=http://localhost:4000
-VITE_SOCKET_URL=http://localhost:4000
-VITE_DEFAULT_THEME=one-dark
-VITE_DEFAULT_LANGUAGE=javascript
-```
-
-**`/server/.env`**
-```env
-# Server
-PORT=4000
-NODE_ENV=development
-CORS_ORIGIN=http://localhost:5173
-# If deploying behind a proxy/CDN, add a comma-separated list:
-# CORS_ORIGIN=https://yourdomain.com,https://www.yourdomain.com
-API_KEY=<API Key>
-SITE_URL=<Site URL>
-SITE_NAME=<Site Name>
-MODEL=<Model_Name>
-```
-
-> In production, set `NODE_ENV=production` and update CORS origins to your deployed frontend.
-
-### NPM Scripts
-
-**At repo root (`package.json`):**
-```json
-{
-  "scripts": {
-    "install:all": "npm --prefix client i && npm --prefix server i",
-    "dev": "concurrently \"npm:dev:client\" \"npm:dev:server\"",
-    "dev:client": "npm --prefix client run dev",
-    "dev:server": "npm --prefix server run dev",
-    "build": "npm --prefix client run build && npm --prefix server run build",
-    "start": "npm --prefix server run start",
-    "lint": "npm --prefix client run lint && npm --prefix server run lint",
-    "format": "npm --prefix client run format && npm --prefix server run format"
-  },
-  "devDependencies": {
-    "concurrently": "^9.0.0"
-  }
-}
-```
-
-**Client scripts (suggested)**
-```json
-{
-  "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview",
-    "lint": "eslint src --ext .ts,.tsx,.js,.jsx",
-    "format": "prettier --write \"src/**/*.{ts,tsx,js,jsx,css,md}\""
-  }
-}
-```
-
----
-
-## Docker (Optional)
-
-```yaml
-# docker-compose.yml
-version: "3.9"
-services:
-  server:
-    build: ./server
-    ports:
-      - "4000:4000"
-    env_file:
-      - ./server/.env
-    environment:
-      - NODE_ENV=production
-    networks:
-      - codexa
-  client:
-    build: ./client
-    ports:
-      - "5173:5173"
-    env_file:
-      - ./client/.env
-    environment:
-      - NODE_ENV=production
-    depends_on:
-      - server
-    networks:
-      - codexa
-networks:
-  codexa:
-    driver: bridge
-```
-
----
-
-## Production Build & Deployment
-
-1. **Build**
-   ```bash
-   npm run build
-   ```
-2. **Run server**
-   ```bash
-   npm run start
-   ```
-3. **Serve client** on any static host/CDN (Netlify, Vercel, S3+CloudFront, Nginx).
-
-> For large rooms / many users, consider a **Socket.io Redis adapter** and sticky sessions.
-
----
-
-## Project Structure
+## Repository layout
 
 ```text
-codexa.ai/
-├─ client/
-│  ├─ src/
-│  │  ├─ components/
-│  │  ├─ editor/            # CodeMirror setup (languages/themes/extensions)
-│  │  ├─ hooks/
-│  │  ├─ recoil/            # atoms/selectors
-│  │  ├─ routes/            # react-router pages
-│  │  ├─ services/          # axios client
-│  │  └─ main.tsx
-│  ├─ index.html
-│  └─ package.json
-├─ server/
-│  ├─ src/
-│  │  ├─ index.js           # express + socket.io bootstrap
-│  │  ├─ sockets.js         # socket handlers
-│  │  ├─ rooms.js           # room registry / utils
-│  │  └─ health.js          # healthcheck route
-│  └─ package.json
-├─ docker-compose.yml
-└─ README.md
+apps/
+  web/        Next.js frontend and Auth.js routes
+  api/        REST API, realtime rooms, collaboration, battle, and AI services
+  executor/   BullMQ worker and isolated code runners
+  mcp/        MCP server with stdio and Streamable HTTP transports
+packages/
+  db/         Prisma schema, migrations, client, and seed script
+  problems/   Curated coding problems, tests, starters, solutions, and editorials
+  types/      Shared Zod schemas and TypeScript types
+  ui/         Shared interface components
+  config/     Shared TypeScript, ESLint, and Tailwind configuration
+docker/
+  executor/   Per-language executor Dockerfiles
+  runner.sh   Sandbox entrypoint reference
+archive/
+  legacy-vite/  Preserved original Vite/Express application
 ```
 
----
+## Prerequisites
 
-## Realtime Collaboration Model
+- Node.js 20 or newer
+- pnpm 9 (the repository pins `pnpm@9.15.4`)
+- Docker Desktop or another compatible Docker engine
 
-```ts
-// client -> server
-"room:join"         // { roomId, username }
-"editor:change"     // { roomId, delta }  // minimal change payload
-"cursor:update"     // { roomId, userId, cursor }
-"state:request"     // ask for current document state
+## Local setup
 
-// server -> clients
-"room:joined"       // participant list, ack
-"editor:apply"      // broadcast changes from others
-"cursor:broadcast"  // presence / selections
-"state:sync"        // current full document snapshot
-"toast:error"       // user-friendly errors
+```bash
+git clone https://github.com/manastole03/Codexa.ai.git
+cd Codexa.ai
+git checkout dev_user/manas_tole
+
+pnpm install
+cp .env.example .env
+pnpm docker:up
+pnpm --filter @codexa/db db:generate
+pnpm db:push
+pnpm db:seed
+pnpm docker:build-execs
+pnpm dev
 ```
 
----
+After startup:
 
-## Theme & Language Support
+| Service | Address |
+| --- | --- |
+| Web application | http://localhost:3000 |
+| API and WebSocket server | http://localhost:4000 |
+| PostgreSQL | `localhost:5432` |
+| Redis | `localhost:6379` |
 
-- **Languages (21)**: e.g., JavaScript/TypeScript, Python, Java, C/C++, Go, Rust, PHP, Ruby, C#, Kotlin, Swift, HTML, CSS, JSON, YAML, Markdown, SQL, Shell, etc. (via CodeMirror 6)
-- **Themes (63)**: popular light/dark sets (One Dark/Light, Dracula, Solarized, Monokai, and more). Preferences persist in local storage.
+The seeded development account is `demo@arena.dev` with password `password123`.
 
----
+### Port conflicts
 
-## Security Notes
+The web and API ports can be changed when their defaults are occupied:
 
-- Configure **CORS** to allowed origins only.
-- Validate room IDs and payload shapes—never trust client input.
-- If enabling persistence, sanitize stored code and use parameterized DB queries.
-- Apply **rate limiting** on REST endpoints (e.g., `/health`) if publicly exposed.
-- When deploying behind a proxy, set `app.set('trust proxy', 1)` and use secure cookies (if introduced later).
+```bash
+# API on 4002
+API_PORT=4002 CORS_ORIGINS=http://localhost:3003 pnpm --filter @codexa/api dev
 
----
+# Web on 3003, connected to the alternate API
+NEXT_PUBLIC_API_URL=http://localhost:4002 \
+NEXTAUTH_URL=http://localhost:3003 \
+pnpm --filter @codexa/web exec next dev -p 3003
+```
 
-## Troubleshooting
+Run the executor separately with `pnpm dev:executor` when using this split startup.
 
-- **Build minification issues (CRA):**  
-  This section has moved here:  
-  https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify
+## Environment variables
 
-- **Sockets not connecting locally**
-  - Check `VITE_SOCKET_URL` and server `PORT`.
-  - Ensure CORS on server allows your client origin.
+Copy `.env.example` to `.env`. The most important settings are:
 
-- **Edits feel laggy**
-  - Debounce/throttle `editor:change` emits.
-  - Ensure the socket instance isn’t recreated each render.
+| Variable | Purpose |
+| --- | --- |
+| `NEXTAUTH_URL` | Public URL used by Auth.js |
+| `AUTH_SECRET` | Auth.js signing secret; required in production |
+| `NEXT_PUBLIC_API_URL` | Browser-facing API URL |
+| `API_PORT` | Express server port |
+| `DATABASE_URL` | PostgreSQL connection string |
+| `REDIS_URL` | Redis/BullMQ connection string |
+| `CORS_ORIGINS` | Comma-separated browser origin allowlist |
+| `OPENROUTER_API_KEY` | OpenRouter credential for room AI features |
+| `OPENROUTER_MODEL` | Model used by the AI assistant |
+| `EXECUTOR_WALL_TIMEOUT_MS` | Maximum execution wall time |
+| `EXECUTOR_MEMORY_MB` | Per-container memory limit |
 
----
+Never commit a populated `.env` file or real provider credentials.
 
-## Roadmap
+## Common commands
 
-- Document history & versioning  
-- Commenting & inline annotations  
-- Presence avatars & typing indicators  
-- Auth & private rooms  
-- Redis adapter for horizontal scaling  
-- Persistence (DB) for saved files/snippets  
+```bash
+pnpm dev                 # Run all workspace development services
+pnpm dev:web             # Run only the Next.js app
+pnpm dev:api             # Run only the API and realtime server
+pnpm dev:executor        # Run only the BullMQ executor
+pnpm dev:mcp             # Run the MCP server over stdio
+pnpm build               # Build every workspace package
+pnpm typecheck           # Type-check every workspace package
+pnpm lint                # Lint every workspace package
+pnpm --filter @codexa/db db:generate  # Generate the Prisma client
+pnpm db:push             # Push the schema in local development
+pnpm db:seed             # Seed the demo user and problem catalog
+pnpm docker:build-execs  # Build JavaScript, Python, and C++ runner images
+pnpm docker:down         # Stop PostgreSQL and Redis
+```
 
----
+## Code execution flow
 
-## Contributing
+1. The web application posts a run or submission request to `/api/submissions`.
+2. The Next.js handler forwards it to the Express API.
+3. The API validates the payload and adds a BullMQ job to Redis.
+4. The executor runs each test in the configured language sandbox.
+5. The API returns per-test status, output, errors, and runtime, and persists submissions when applicable.
 
-1. Fork the repo and create a feature branch.
-2. Run `npm run dev` and ensure lint passes: `npm run lint`.
-3. Open a PR with screenshots/GIFs for UI changes.
+The first-class Docker runners are JavaScript, Python, and C++. Additional language definitions are scaffolded under `docker/executor/` and `apps/executor/src/languages.ts`.
 
-Please follow **conventional commits** where possible.
+Each Docker execution runs without network access, with a read-only root filesystem, a temporary work directory, dropped Linux capabilities, process limits, and configurable CPU, memory, and wall-time limits. The host fallback is intended only for trusted local development; production deployments should use the Docker sandbox and stronger isolation such as gVisor or Kata Containers where appropriate.
 
----
+## MCP server
+
+Run the server over stdio:
+
+```bash
+pnpm --filter @codexa/mcp dev
+```
+
+Or start its Streamable HTTP transport on port 5050:
+
+```bash
+pnpm --filter @codexa/mcp dev:http
+```
+
+Available tools include `list_products`, `list_problems`, `get_problem`, `get_solution`, `get_editorial`, `get_hints`, and `validate_solution`. Resources use the forms `problem://<slug>`, `solution://<slug>/<language>`, and `editorial://<slug>`.
+
+## Adding a problem
+
+1. Create `packages/problems/src/problems/<slug>.ts`.
+2. Export a `Problem` using the package's `mkProblem` helper.
+3. Add the problem to `packages/problems/src/index.ts`.
+4. Run `pnpm db:seed`.
+
+The seed operation upserts problem metadata and refreshes examples, constraints, hints, starter code, reference solutions, and test cases.
+
+## Production notes
+
+- Set a strong `AUTH_SECRET` and explicit `CORS_ORIGINS`.
+- Apply checked-in migrations with `pnpm --filter @codexa/db db:migrate:deploy`.
+- Keep PostgreSQL and Redis private and authenticated.
+- Build and control private executor images; do not enable host fallback for untrusted code.
+- Put the web and API services behind TLS and configure `TRUST_PROXY` for the deployment topology.
+- Store AI and OAuth credentials in the deployment platform's secret manager.
 
 ## License
 
-Licensed under the **MIT License**.
+No license has been declared. All rights are reserved unless the repository owner states otherwise.

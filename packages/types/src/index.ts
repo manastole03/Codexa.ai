@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const productKindSchema = z.enum(["collaborative", "arena"]);
+export const productKindSchema = z.enum(["collaborative", "arena", "system-design"]);
 export type ProductKind = z.infer<typeof productKindSchema>;
 
 export const languageSchema = z.enum([
@@ -128,6 +128,49 @@ export const collabPresenceSchema = z.object({
 });
 export type CollabPresence = z.infer<typeof collabPresenceSchema>;
 
+export const battlePhaseSchema = z.enum(["idle", "lobby", "countdown", "running", "ended"]);
+export type BattlePhase = z.infer<typeof battlePhaseSchema>;
+
+export const battleParticipantStatusSchema = z.enum([
+  "joined",
+  "coding",
+  "running",
+  "submitted",
+  "disconnected"
+]);
+export type BattleParticipantStatus = z.infer<typeof battleParticipantStatusSchema>;
+
+export const battleResultSchema = z.object({
+  passed: z.number(),
+  total: z.number(),
+  status: z.string(),
+  runtimeMs: z.number(),
+  submittedAt: z.string()
+});
+export type BattleResult = z.infer<typeof battleResultSchema>;
+
+export const battleParticipantSchema = z.object({
+  socketId: z.string(),
+  name: z.string(),
+  role: roomRoleSchema,
+  status: battleParticipantStatusSchema,
+  result: battleResultSchema.optional()
+});
+export type BattleParticipant = z.infer<typeof battleParticipantSchema>;
+
+export const battleStateSchema = z.object({
+  phase: battlePhaseSchema,
+  problemSlug: z.string().optional(),
+  durationMs: z.number(),
+  startedAt: z.number().optional(),
+  endsAt: z.number().optional(),
+  countdownEndsAt: z.number().optional(),
+  participants: z.array(battleParticipantSchema),
+  hostSocketId: z.string().optional(),
+  revealCode: z.boolean().default(false)
+});
+export type BattleState = z.infer<typeof battleStateSchema>;
+
 export const arenaRoomStateSchema = z.object({
   selectedProblemSlug: z.string().optional(),
   language: languageSchema.default("javascript")
@@ -165,7 +208,17 @@ export const submissionCreateSchema = z.object({
   code: z.string().min(1),
   stdin: z.string().optional(),
   roomId: z.string().optional(),
-  mode: z.enum(["run", "submit"]).default("run")
+  mode: z.enum(["run", "submit"]).default("run"),
+  tests: z
+    .array(
+      z.object({
+        id: z.string(),
+        input: z.string(),
+        expected: z.string(),
+        hidden: z.boolean().optional()
+      })
+    )
+    .optional()
 });
 export type SubmissionCreateInput = z.infer<typeof submissionCreateSchema>;
 

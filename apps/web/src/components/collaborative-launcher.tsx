@@ -24,7 +24,8 @@ export function RoomLauncher({
   const [email, setEmail] = useState("");
   const [error, setError] = useState("");
 
-  const productLabel = product === "arena" ? "Arena" : "Collaborative";
+  const productLabel =
+    product === "arena" ? "Arena" : product === "system-design" ? "System Design" : "Collaborative";
 
   function requireName() {
     const trimmed = name.trim();
@@ -44,7 +45,10 @@ export function RoomLauncher({
     if (email.trim()) {
       params.set("email", email.trim().toLowerCase());
     }
-    return `/rooms/${id}?${params.toString()}`;
+    // System Design has its own dedicated workspace route. The shared
+    // /rooms/[id] page is hard-coded to collaborative | arena.
+    const base = product === "system-design" ? "/system-design" : "/rooms";
+    return `${base}/${id}?${params.toString()}`;
   }
 
   function createRoom() {
@@ -116,4 +120,8 @@ export function RoomLauncher({
 
 export function CollaborativeLauncher() {
   return <RoomLauncher product="collaborative" />;
+}
+
+export function SystemDesignLauncher() {
+  return <RoomLauncher product="system-design" title="Create or join a whiteboard" />;
 }

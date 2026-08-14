@@ -7,6 +7,11 @@
   "types": "./src/client.ts",
   "scripts": {
     "build": "prisma generate && tsc -p tsconfig.json --noEmit false --emitDeclarationOnly --outDir dist",
+    "db:migrate": "prisma migrate dev",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:migrate:status": "prisma migrate status",
+    "db:migrate:reset": "prisma migrate reset",
+    "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:seed": "tsx src/seed.ts",
     "typecheck": "tsc -p tsconfig.json",

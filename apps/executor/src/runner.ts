@@ -1,11 +1,35 @@
 import Docker from "dockerode";
 import type { Language, RunResult, SubmissionStatus, TestCase } from "@codexa/types";
 import { languageRuntimes } from "./languages.js";
+import { hostModeSupports, runHostMode } from "./host-runner.js";
 
 const docker = new Docker();
 const wallTimeoutMs = Number(process.env.EXECUTOR_WALL_TIMEOUT_MS ?? 5000);
 const memoryMb = Number(process.env.EXECUTOR_MEMORY_MB ?? 256);
 const cpuCount = Number(process.env.EXECUTOR_CPU_COUNT ?? 1);
+const allowHostFallback = process.env.EXECUTOR_DISABLE_HOST_FALLBACK !== "true";
+
+let dockerReady: boolean | null = null;
+async function dockerAvailable() {
+  if (dockerReady !== null) return dockerReady;
+  try {
+    await docker.ping();
+    dockerReady = true;
+  } catch {
+    dockerReady = false;
+    console.warn("[executor] Docker is not reachable — falling back to host-mode runner (JS/Python only). Run `pnpm docker:build-execs` and ensure Docker Desktop is running for sandboxed execution.");
+  }
+  return dockerReady;
+}
+
+async function dockerImageExists(image: string) {
+  try {
+    await docker.getImage(image).inspect();
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function normalize(value: string) {
   return value.replace(/\r\n/g, "\n").trim();
@@ -26,15 +50,14 @@ function splitDockerOutput(buffer: Buffer) {
   return Buffer.concat(chunks.length ? chunks : [buffer]).toString("utf8");
 }
 
-async function runContainer(language: Language, code: string, input: string) {
+async function runViaDocker(language: Language, code: string, input: string) {
   const runtime = languageRuntimes[language];
   if (!runtime.executable) {
-    return {
-      stdout: "",
-      stderr: `${language} execution is scaffolded. Build its Dockerfile and set executable: true in apps/executor/src/languages.ts.`,
-      runtimeMs: 0,
-      timedOut: false
-    };
+    throw new Error(`Docker image for ${language} is not configured`);
+  }
+  const imageOk = await dockerImageExists(runtime.image);
+  if (!imageOk) {
+    throw new Error(`Docker image '${runtime.image}' not found. Run \`pnpm docker:build-execs\`.`);
   }
 
   const codeB64 = Buffer.from(code).toString("base64");
@@ -98,7 +121,38 @@ async function runContainer(language: Language, code: string, input: string) {
     stdout: failed ? "" : output,
     stderr: failed ? output || ("Error" in result ? String(result.Error) : "Runtime error") : "",
     runtimeMs,
-    timedOut
+    timedOut,
+    mode: "docker" as const
+  };
+}
+
+async function runContainer(language: Language, code: string, input: string) {
+  if (await dockerAvailable()) {
+    try {
+      return await runViaDocker(language, code, input);
+    } catch (error) {
+      if (!allowHostFallback || !hostModeSupports(language)) {
+        return {
+          stdout: "",
+          stderr: error instanceof Error ? error.message : "Docker execution failed",
+          runtimeMs: 0,
+          timedOut: false,
+          mode: "docker" as const
+        };
+      }
+    }
+  }
+
+  if (allowHostFallback && hostModeSupports(language)) {
+    return runHostMode(language, code, input);
+  }
+
+  return {
+    stdout: "",
+    stderr: `Execution unavailable for ${language}. Docker images are not built and host fallback is disabled.`,
+    runtimeMs: 0,
+    timedOut: false,
+    mode: "docker" as const
   };
 }
 
@@ -113,8 +167,23 @@ export async function runTests({
 }): Promise<{ status: SubmissionStatus; results: RunResult[]; runtimeMs: number }> {
   const results: RunResult[] = [];
 
+  if (tests.length === 0) {
+    return { status: "SYSTEM_ERROR", results: [], runtimeMs: 0 };
+  }
+
   for (const test of tests) {
-    const result = await runContainer(language, code, test.input);
+    let result: { stdout: string; stderr: string; runtimeMs: number; timedOut: boolean };
+    try {
+      result = await runContainer(language, code, test.input);
+    } catch (error) {
+      result = {
+        stdout: "",
+        stderr: error instanceof Error ? error.message : "Execution failed",
+        runtimeMs: 0,
+        timedOut: false
+      };
+    }
+
     const status: SubmissionStatus = result.timedOut
       ? "TIME_LIMIT_EXCEEDED"
       : result.stderr
@@ -131,14 +200,15 @@ export async function runTests({
       expected: test.expected,
       runtimeMs: result.runtimeMs
     });
-
-    if (status !== "ACCEPTED") {
-      break;
-    }
   }
 
-  const runtimeMs = results.reduce((sum, result) => sum + result.runtimeMs, 0);
-  const status = results.every((result) => result.status === "ACCEPTED") ? "ACCEPTED" : results[results.length - 1]?.status ?? "SYSTEM_ERROR";
+  const runtimeMs = results.reduce((sum, r) => sum + r.runtimeMs, 0);
+  const overall: SubmissionStatus = results.every((r) => r.status === "ACCEPTED")
+    ? "ACCEPTED"
+    : results.find((r) => r.status === "RUNTIME_ERROR")?.status ??
+      results.find((r) => r.status === "TIME_LIMIT_EXCEEDED")?.status ??
+      results.find((r) => r.status === "WRONG_ANSWER")?.status ??
+      "SYSTEM_ERROR";
 
-  return { status, results, runtimeMs };
+  return { status: overall, results, runtimeMs };
 }

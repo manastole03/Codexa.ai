@@ -10,6 +10,7 @@ datasource db {
 enum ProductKind {
   COLLABORATIVE
   ARENA
+  SYSTEM_DESIGN
 }
 
 enum Difficulty {

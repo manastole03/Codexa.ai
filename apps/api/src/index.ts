@@ -1,29 +1,47 @@
 import "dotenv/config";
 import http from "node:http";
-import cors from "cors";
 import express from "express";
 import { Queue, QueueEvents } from "bullmq";
 import { Redis } from "ioredis";
 import { Server } from "socket.io";
 import * as Y from "yjs";
 import * as awarenessProtocol from "y-protocols/awareness";
+import { z } from "zod";
 import { getProblem, listProblems, supportedLanguages } from "@codexa/problems";
 import { prisma } from "@codexa/db";
-import { roomCreateSchema, submissionCreateSchema, type ActiveRoomUser, type CollabFileMeta, type Language, type ProductKind, type Submission } from "@codexa/types";
+import {
+  roomCreateSchema,
+  submissionCreateSchema,
+  type ActiveRoomUser,
+  type BattleParticipant,
+  type BattleParticipantStatus,
+  type BattlePhase,
+  type BattleState,
+  type CollabFileMeta,
+  type Language,
+  type ProductKind,
+  type Submission
+} from "@codexa/types";
+import { config, isOriginAllowed } from "./config.js";
+import { applySecurity, asyncRoute, errorHandler, limiters } from "./security.js";
 
-const port = Number(process.env.API_PORT ?? 4000);
-const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: true,
+    origin: (origin, callback) => {
+      if (isOriginAllowed(origin ?? undefined)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error(`Origin ${origin ?? "(none)"} not allowed by CORS policy`), false);
+    },
     credentials: true
   },
   maxHttpBufferSize: 5e6
 });
 
-const redisConnection = new Redis(redisUrl, { maxRetriesPerRequest: null });
+const redisConnection = new Redis(config.redisUrl, { maxRetriesPerRequest: null });
 const submissionsQueue = new Queue("submissions", { connection: redisConnection });
 const submissionsEvents = new QueueEvents("submissions", { connection: redisConnection });
 const roomDocs = new Map<string, Y.Doc>();
@@ -36,6 +54,7 @@ const roomStates = new Map<
     selectedProblemSlug?: string;
     language: Language;
     excalidrawScene?: ExcalidrawScene;
+    systemDesignScene?: SystemDesignScene;
     ended: boolean;
   }
 >();
@@ -49,6 +68,26 @@ type RoomCollabState = {
 };
 
 const roomCollabStates = new Map<string, RoomCollabState>();
+
+type RoomBattleState = {
+  phase: BattlePhase;
+  problemSlug?: string;
+  durationMs: number;
+  startedAt?: number;
+  endsAt?: number;
+  countdownEndsAt?: number;
+  hostSocketId?: string;
+  revealCode: boolean;
+  participants: Map<string, BattleParticipant>;
+  excluded: Set<string>;
+  tickInterval?: NodeJS.Timeout;
+  endTimeout?: NodeJS.Timeout;
+  countdownTimeout?: NodeJS.Timeout;
+};
+
+const roomBattles = new Map<string, RoomBattleState>();
+const DEFAULT_BATTLE_DURATION_MS = 30 * 60 * 1000;
+const COUNTDOWN_MS = 3000;
 
 const PRISMA_LANGUAGE_TO_TYPES: Record<string, Language> = {
   JAVASCRIPT: "javascript",
@@ -74,9 +113,31 @@ function languageFromPrisma(value: string): Language {
   return PRISMA_LANGUAGE_TO_TYPES[value] ?? "javascript";
 }
 
+/**
+ * Map a wire-format ProductKind (kebab-case) to the Prisma enum value
+ * (SCREAMING_SNAKE_CASE). The straight .toUpperCase() that the older code used
+ * silently produced "SYSTEM-DESIGN" which Prisma rejected.
+ */
+function productToPrisma(product: ProductKind): string {
+  return product.toUpperCase().replace(/-/g, "_");
+}
+
 type ExcalidrawScene = {
   elements: unknown[];
   files?: Record<string, unknown>;
+};
+
+type SystemDesignScene = {
+  nodes: unknown[];
+  edges: unknown[];
+  templateId?: string;
+  templateName?: string;
+  workload?: unknown;
+  simulationRunning?: boolean;
+  chaosEvents?: unknown[];
+  notes?: string;
+  challenge?: unknown;
+  updatedAt?: number;
 };
 
 type McpToolCall = {
@@ -84,14 +145,43 @@ type McpToolCall = {
   output: string;
 };
 
-app.use(cors({ origin: true, credentials: true }));
+const mcpChatSchema = z.object({
+  message: z.string().min(1).max(4000),
+  roomId: z.string().max(128).optional(),
+  problemSlug: z.string().max(200).optional(),
+  code: z.string().max(20_000).optional(),
+  language: z.string().max(40).optional()
+});
+
+const mcpInvokeSchema = z.object({
+  name: z.string().min(1).max(120),
+  arguments: z.record(z.unknown()).optional()
+});
+
+const collabAiChatSchema = z.object({
+  message: z.string().min(1).max(8000),
+  roomId: z.string().max(128).optional(),
+  currentFileId: z.string().max(128).optional(),
+  fileName: z.string().max(255).optional(),
+  history: z
+    .array(
+      z.object({
+        role: z.enum(["user", "assistant"]),
+        content: z.string().max(8000)
+      })
+    )
+    .max(20)
+    .optional()
+});
+
+applySecurity(app);
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_request, response) => {
   response.json({
     ok: true,
     services: {
-      products: ["collaborative", "arena"],
+      products: ["collaborative", "arena", "system-design"],
       realtime: "socket.io+yjs",
       queue: "bullmq",
       executor: "dockerode"
@@ -111,35 +201,48 @@ app.get("/products", (_request, response) => {
         key: "arena",
         name: "LeetCode Arena",
         route: "/arena"
+      },
+      {
+        key: "system-design",
+        name: "System Design",
+        route: "/system-design"
       }
     ]
   });
 });
 
-app.post("/rooms", async (request, response) => {
-  const input = roomCreateSchema.parse(request.body);
-  const room = await prisma.room.create({
-    data: {
-      product: input.product.toUpperCase() as never,
-      name: input.name,
-      language: input.language.toUpperCase() as never,
-      problemSlug: input.problemSlug
-    }
-  });
-  response.status(201).json(room);
-});
+app.post(
+  "/rooms",
+  limiters.write,
+  asyncRoute(async (request, response) => {
+    const input = roomCreateSchema.parse(request.body);
+    const room = await prisma.room.create({
+      data: {
+        product: productToPrisma(input.product) as never,
+        name: input.name,
+        language: input.language.toUpperCase() as never,
+        problemSlug: input.problemSlug
+      }
+    });
+    response.status(201).json(room);
+  })
+);
 
-app.post("/collab/rooms", async (request, response) => {
-  const input = roomCreateSchema.parse({ ...request.body, product: "collaborative" });
-  const room = await prisma.room.create({
-    data: {
-      product: "COLLABORATIVE",
-      name: input.name,
-      language: input.language.toUpperCase() as never
-    }
-  });
-  response.status(201).json(room);
-});
+app.post(
+  "/collab/rooms",
+  limiters.write,
+  asyncRoute(async (request, response) => {
+    const input = roomCreateSchema.parse({ ...request.body, product: "collaborative" });
+    const room = await prisma.room.create({
+      data: {
+        product: "COLLABORATIVE",
+        name: input.name,
+        language: input.language.toUpperCase() as never
+      }
+    });
+    response.status(201).json(room);
+  })
+);
 
 app.get("/arena/languages", (_request, response) => {
   response.json({ languages: supportedLanguages });
@@ -164,6 +267,296 @@ app.get("/arena/problems/:slug", (request, response) => {
   response.json({ problem });
 });
 
+type LeetcodeListItem = {
+  id: string;
+  frontend_id: string;
+  title: string;
+  title_slug: string;
+  url: string;
+  difficulty: "Easy" | "Medium" | "Hard";
+  paid_only: boolean;
+  has_solution: boolean;
+  has_video_solution: boolean;
+};
+
+type NormalizedLeetcodeProblem = {
+  slug: string;
+  frontendId: string;
+  source: "leetcode";
+  title: string;
+  difficulty: "EASY" | "MEDIUM" | "HARD";
+  tags: string[];
+  summary: string;
+  statement: string;
+  constraints: string[];
+  hints: string[];
+  editorial: string;
+  url: string;
+  examples: Array<{ input: string; output: string; explanation?: string }>;
+  tests: Array<{ id: string; input: string; expected: string; hidden: boolean }>;
+  starters: Record<string, string>;
+  solutions: Record<string, string>;
+};
+
+const LEETCODE_API = "https://leetcode-api-pied.vercel.app";
+const leetcodeListCache: { data: LeetcodeListItem[]; fetchedAt: number } = {
+  data: [],
+  fetchedAt: 0
+};
+const leetcodeDetailCache = new Map<string, { data: NormalizedLeetcodeProblem; fetchedAt: number }>();
+const LEETCODE_LIST_TTL = 6 * 60 * 60 * 1000;
+const LEETCODE_DETAIL_TTL = 24 * 60 * 60 * 1000;
+
+function stripHtml(html: string) {
+  return html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p\s*>/gi, "\n\n")
+    .replace(/<\/li\s*>/gi, "\n")
+    .replace(/<\/pre\s*>/gi, "\n")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<sup>(.*?)<\/sup>/gi, "^$1")
+    .replace(/<sub>(.*?)<\/sub>/gi, "_$1")
+    .replace(/<code>(.*?)<\/code>/gi, "`$1`")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function extractExamplesFromContent(content: string): Array<{ input: string; output: string; explanation?: string }> {
+  if (!content) return [];
+  const text = stripHtml(content);
+  const examples: Array<{ input: string; output: string; explanation?: string }> = [];
+  const exampleRegex = /Example\s*\d+\s*:?([\s\S]*?)(?=Example\s*\d+\s*:?|Constraints\s*:?|$)/gi;
+  for (const match of text.matchAll(exampleRegex)) {
+    const block = match[1] ?? "";
+    const inputMatch = block.match(/Input\s*:?\s*([\s\S]*?)(?=Output\s*:|Explanation\s*:|$)/i);
+    const outputMatch = block.match(/Output\s*:?\s*([\s\S]*?)(?=Explanation\s*:|Example\s*\d+|Constraints|$)/i);
+    const explanationMatch = block.match(/Explanation\s*:?\s*([\s\S]*?)(?=Example\s*\d+|Constraints|$)/i);
+    const input = inputMatch?.[1]?.trim() ?? "";
+    const output = outputMatch?.[1]?.trim() ?? "";
+    if (!input && !output) continue;
+    const example: { input: string; output: string; explanation?: string } = { input, output };
+    if (explanationMatch) example.explanation = explanationMatch[1]?.trim();
+    examples.push(example);
+  }
+  return examples;
+}
+
+function extractConstraints(content: string): string[] {
+  const text = stripHtml(content);
+  const idx = text.search(/Constraints\s*:?/i);
+  if (idx === -1) return [];
+  const block = text.slice(idx).replace(/^Constraints\s*:?/i, "").trim();
+  return block
+    .split(/\n/)
+    .map((line) => line.replace(/^[-•·]\s*/, "").trim())
+    .filter((line) => line.length > 0 && line.length < 200)
+    .slice(0, 8);
+}
+
+function extractStatement(content: string): string {
+  const text = stripHtml(content);
+  const idx = text.search(/Example\s*\d+\s*:?/i);
+  return (idx === -1 ? text : text.slice(0, idx)).trim();
+}
+
+function leetcodeStarters(): Record<string, string> {
+  return {
+    javascript: `// Read input from stdin, write answer to stdout.
+const input = require("fs").readFileSync("/dev/stdin", "utf8").trim();
+
+function solve(raw) {
+  // Parse \`raw\` and return the answer. Example: "nums = [2,7,11,15], target = 9"
+  return "";
+}
+
+console.log(solve(input));`,
+    typescript: `import { readFileSync } from "fs";
+const input = readFileSync("/dev/stdin", "utf8").trim();
+
+function solve(raw: string): string | number {
+  return "";
+}
+
+console.log(solve(input));`,
+    python: `import sys
+
+def solve(raw: str):
+    # Parse \`raw\` and return the answer
+    return ""
+
+print(solve(sys.stdin.read().strip()))`,
+    cpp: `#include <bits/stdc++.h>
+using namespace std;
+
+int main() {
+    string line, all;
+    while (getline(cin, line)) { all += line + "\\n"; }
+    // Parse \`all\` and print the answer.
+    return 0;
+}`,
+    java: `import java.io.*;
+import java.util.*;
+
+public class Main {
+    public static void main(String[] args) throws IOException {
+        BufferedReader br = new BufferedReader(new InputStreamReader(System.in));
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = br.readLine()) != null) sb.append(line).append("\\n");
+        String raw = sb.toString().trim();
+        // Parse \`raw\` and print the answer.
+    }
+}`,
+    go: `package main
+
+import (
+    "bufio"
+    "fmt"
+    "os"
+    "strings"
+)
+
+func main() {
+    reader := bufio.NewReader(os.Stdin)
+    var sb strings.Builder
+    for {
+        line, err := reader.ReadString('\\n')
+        sb.WriteString(line)
+        if err != nil { break }
+    }
+    raw := strings.TrimSpace(sb.String())
+    _ = raw
+    fmt.Println("")
+}`,
+    rust: `use std::io::{self, Read};
+
+fn main() {
+    let mut raw = String::new();
+    io::stdin().read_to_string(&mut raw).unwrap();
+    let _ = raw.trim();
+    println!("");
+}`
+  };
+}
+
+async function fetchLeetcodeList(): Promise<LeetcodeListItem[]> {
+  const now = Date.now();
+  if (leetcodeListCache.data.length > 0 && now - leetcodeListCache.fetchedAt < LEETCODE_LIST_TTL) {
+    return leetcodeListCache.data;
+  }
+  const res = await fetch(`${LEETCODE_API}/problems`);
+  if (!res.ok) throw new Error(`Upstream ${res.status}`);
+  const data = (await res.json()) as LeetcodeListItem[];
+  leetcodeListCache.data = data;
+  leetcodeListCache.fetchedAt = now;
+  return data;
+}
+
+async function fetchLeetcodeDetail(slug: string): Promise<NormalizedLeetcodeProblem | null> {
+  const now = Date.now();
+  const cached = leetcodeDetailCache.get(slug);
+  if (cached && now - cached.fetchedAt < LEETCODE_DETAIL_TTL) return cached.data;
+  const res = await fetch(`${LEETCODE_API}/problem/${encodeURIComponent(slug)}`);
+  if (!res.ok) return null;
+  const raw = (await res.json()) as {
+    questionId?: string;
+    questionFrontendId?: string;
+    title?: string;
+    titleSlug?: string;
+    content?: string;
+    difficulty?: string;
+    hints?: string[];
+    topicTags?: Array<{ name: string; slug?: string }>;
+    similarQuestions?: string;
+    url?: string;
+  };
+
+  const content = raw.content ?? "";
+  const examples = extractExamplesFromContent(content);
+  const constraints = extractConstraints(content);
+  const statement = extractStatement(content);
+  const difficulty = (raw.difficulty ?? "Medium").toUpperCase() as "EASY" | "MEDIUM" | "HARD";
+
+  const normalized: NormalizedLeetcodeProblem = {
+    slug,
+    frontendId: raw.questionFrontendId ?? raw.questionId ?? slug,
+    source: "leetcode",
+    title: raw.title ?? slug,
+    difficulty: difficulty === "EASY" || difficulty === "MEDIUM" || difficulty === "HARD" ? difficulty : "MEDIUM",
+    tags: (raw.topicTags ?? []).map((t) => t.name).filter(Boolean),
+    summary: statement.slice(0, 200).split("\n")[0] ?? "",
+    statement,
+    constraints,
+    hints: raw.hints ?? [],
+    editorial: "",
+    url: raw.url ?? `https://leetcode.com/problems/${slug}/`,
+    examples,
+    tests: examples.map((ex, idx) => ({
+      id: `example-${idx + 1}`,
+      input: ex.input,
+      expected: ex.output,
+      hidden: false
+    })),
+    starters: leetcodeStarters(),
+    solutions: {}
+  };
+
+  leetcodeDetailCache.set(slug, { data: normalized, fetchedAt: now });
+  return normalized;
+}
+
+app.get("/arena/leetcode/problems", limiters.upstream, async (request, response) => {
+  try {
+    const list = await fetchLeetcodeList();
+    const query = String(request.query.query ?? "").trim().toLowerCase();
+    const difficulty = String(request.query.difficulty ?? "").trim();
+    const filtered = list
+      .filter((item) => !item.paid_only)
+      .filter((item) => (difficulty ? item.difficulty.toUpperCase() === difficulty.toUpperCase() : true))
+      .filter((item) => (query ? item.title.toLowerCase().includes(query) || item.title_slug.includes(query) : true));
+    response.json({
+      total: filtered.length,
+      problems: filtered.slice(0, 200).map((item) => ({
+        slug: item.title_slug,
+        frontendId: item.frontend_id,
+        title: item.title,
+        difficulty: item.difficulty.toUpperCase(),
+        url: item.url,
+        hasSolution: item.has_solution
+      }))
+    });
+  } catch (error) {
+    response.status(502).json({
+      error: error instanceof Error ? error.message : "Failed to fetch LeetCode problems"
+    });
+  }
+});
+
+app.get("/arena/leetcode/problem/:slug", limiters.upstream, async (request, response) => {
+  try {
+    const slug = String(request.params.slug ?? "");
+    const normalized = await fetchLeetcodeDetail(slug);
+    if (!normalized) {
+      response.status(404).json({ error: "Problem not found" });
+      return;
+    }
+    response.json({ problem: normalized });
+  } catch (error) {
+    response.status(502).json({
+      error: error instanceof Error ? error.message : "Failed to fetch problem"
+    });
+  }
+});
+
 function cleanString(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -178,21 +571,16 @@ function summarizeCode(code: string) {
   return `${lines} lines, ${code.length} characters`;
 }
 
-app.post("/mcp/chat", (request, response) => {
-  const message = cleanString(request.body?.message);
-  const roomId = cleanString(request.body?.roomId);
-  const problemSlug = cleanString(request.body?.problemSlug);
-  const code = cleanString(request.body?.code);
-  const requestedLanguage = request.body?.language as unknown;
-  const language: Language = isLanguage(requestedLanguage) ? requestedLanguage : "javascript";
+app.post("/mcp/chat", limiters.ai, (request, response) => {
+  const input = mcpChatSchema.parse(request.body);
+  const message = input.message.trim();
+  const roomId = input.roomId?.trim() ?? "";
+  const problemSlug = input.problemSlug?.trim() ?? "";
+  const code = input.code ?? "";
+  const language: Language = isLanguage(input.language) ? input.language : "javascript";
   const problem = problemSlug ? getProblem(problemSlug) : undefined;
   const lowerMessage = message.toLowerCase();
   const toolCalls: McpToolCall[] = [];
-
-  if (!message) {
-    response.status(400).json({ error: "Message is required." });
-    return;
-  }
 
   if (!problem) {
     const suggestions = listProblems().slice(0, 5);
@@ -298,110 +686,216 @@ app.post("/mcp/chat", (request, response) => {
   });
 });
 
-app.post("/collab/ai-chat", async (request, response) => {
-  const message = cleanString(request.body?.message);
-  const roomId = cleanString(request.body?.roomId);
-  const currentFileId = cleanString(request.body?.currentFileId);
-  let fileName = cleanString(request.body?.fileName);
-  let code = "";
-  if (roomId && currentFileId) {
-    const collab = roomCollabStates.get(roomId);
-    if (collab) {
-      const meta = collab.doc.getMap("fileMeta").get(currentFileId) as { name?: string } | undefined;
-      if (meta?.name) fileName = meta.name;
-      code = collab.doc.getText(`file:${currentFileId}`).toString();
-    }
+const mcpHttpUrl = config.mcp.url;
+
+async function callMcp(method: string, params: Record<string, unknown> = {}) {
+  const id = Math.floor(Math.random() * 1e9);
+  const res = await fetch(mcpHttpUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream"
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id, method, params })
+  });
+  if (!res.ok) {
+    throw new Error(`MCP ${method} failed: HTTP ${res.status}`);
   }
-  const history = Array.isArray(request.body?.history)
-    ? (request.body.history as Array<{ role: "user" | "assistant"; content: string }>)
-        .slice(-8)
-        .filter((m) => m && typeof m.content === "string")
-    : [];
-
-  if (!message) {
-    response.status(400).json({ error: "Message is required." });
-    return;
+  const contentType = res.headers.get("content-type") ?? "";
+  let payload: { result?: unknown; error?: { message: string } };
+  if (contentType.includes("text/event-stream")) {
+    const text = await res.text();
+    const dataLine = text.split(/\r?\n/).find((line) => line.startsWith("data: "));
+    if (!dataLine) throw new Error(`MCP ${method} returned empty SSE`);
+    payload = JSON.parse(dataLine.slice(6));
+  } else {
+    payload = await res.json();
   }
+  if (payload.error) throw new Error(payload.error.message);
+  return payload.result;
+}
 
-  const apiKey = process.env.OPENROUTER_API_KEY ?? process.env.AI_API_KEY;
-  const baseUrl = process.env.AI_BASE_URL ?? "https://openrouter.ai/api/v1";
-  const model = process.env.OPENROUTER_MODEL ?? "openrouter/auto";
-
-  if (!apiKey) {
-    response.json({
-      reply: [
-        "AI chat is unconfigured.",
-        "",
-        "Set OPENROUTER_API_KEY (or AI_API_KEY + AI_BASE_URL) in your .env to enable real responses.",
-        "",
-        `Echo: ${message}`,
-        fileName ? `Current file: ${fileName} (${summarizeCode(code)})` : ""
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      model: null,
-      context: { roomId, fileName }
-    });
-    return;
-  }
-
+app.get("/mcp/status", async (_request, response) => {
   try {
-    const systemPrompt = [
-      "You are an AI pair programmer embedded in a collaborative VS Code-like room called Codexa.",
-      "Keep replies concise and practical. Prefer code diffs when explaining changes.",
-      fileName ? `The user is currently editing ${fileName}.` : "",
-      code ? `Current file contents:\n\n${code.slice(0, 4000)}` : ""
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-
-    const upstream = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        ...(process.env.OPENROUTER_SITE_URL ? { "HTTP-Referer": process.env.OPENROUTER_SITE_URL } : {}),
-        ...(process.env.OPENROUTER_SITE_NAME ? { "X-Title": process.env.OPENROUTER_SITE_NAME } : {})
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          ...history.map((m) => ({ role: m.role, content: m.content })),
-          { role: "user", content: message }
-        ],
-        temperature: 0.3,
-        max_tokens: 800
-      })
+    const initResult = (await callMcp("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "codexa-api", version: "1.0.0" }
+    })) as { serverInfo?: { name?: string; version?: string }; protocolVersion?: string };
+    response.json({
+      online: true,
+      url: mcpHttpUrl,
+      serverInfo: initResult?.serverInfo ?? null,
+      protocolVersion: initResult?.protocolVersion ?? null
     });
-
-    if (!upstream.ok) {
-      const detail = await upstream.text().catch(() => "");
-      response.status(502).json({ error: `Upstream AI error (${upstream.status}): ${detail.slice(0, 200)}` });
-      return;
-    }
-
-    const payload = (await upstream.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const reply = payload.choices?.[0]?.message?.content ?? "(empty response)";
-    response.json({ reply, model, context: { roomId, fileName } });
   } catch (error) {
-    response.status(500).json({
-      error: error instanceof Error ? error.message : "AI chat failed."
+    response.json({
+      online: false,
+      url: mcpHttpUrl,
+      error: error instanceof Error ? error.message : "unreachable"
     });
   }
 });
 
-app.post("/submissions", async (request, response) => {
+app.get("/mcp/tools", async (_request, response) => {
+  try {
+    const result = (await callMcp("tools/list")) as { tools: unknown[] };
+    response.json({ tools: result.tools ?? [] });
+  } catch (error) {
+    response.status(502).json({
+      error: error instanceof Error ? error.message : "MCP tools/list failed"
+    });
+  }
+});
+
+app.get("/mcp/resources", async (_request, response) => {
+  try {
+    const [resources, templates] = await Promise.all([
+      callMcp("resources/list").catch(() => ({ resources: [] })),
+      callMcp("resources/templates/list").catch(() => ({ resourceTemplates: [] }))
+    ]);
+    response.json({
+      resources: (resources as { resources: unknown[] }).resources ?? [],
+      templates: (templates as { resourceTemplates: unknown[] }).resourceTemplates ?? []
+    });
+  } catch (error) {
+    response.status(502).json({
+      error: error instanceof Error ? error.message : "MCP resources/list failed"
+    });
+  }
+});
+
+app.post(
+  "/mcp/invoke",
+  limiters.write,
+  asyncRoute(async (request, response) => {
+    const input = mcpInvokeSchema.parse(request.body);
+    try {
+      const result = await callMcp("tools/call", { name: input.name, arguments: input.arguments ?? {} });
+      response.json({ ok: true, result });
+    } catch (error) {
+      response.status(502).json({
+        ok: false,
+        error: error instanceof Error ? error.message : "MCP tool call failed"
+      });
+    }
+  })
+);
+
+app.post(
+  "/collab/ai-chat",
+  limiters.ai,
+  asyncRoute(async (request, response) => {
+    const input = collabAiChatSchema.parse(request.body);
+    const message = input.message.trim();
+    const roomId = input.roomId?.trim() ?? "";
+    const currentFileId = input.currentFileId?.trim() ?? "";
+    let fileName = input.fileName?.trim() ?? "";
+    let code = "";
+    if (roomId && currentFileId) {
+      const collab = roomCollabStates.get(roomId);
+      if (collab) {
+        const meta = collab.doc.getMap("fileMeta").get(currentFileId) as { name?: string } | undefined;
+        if (meta?.name) fileName = meta.name;
+        code = collab.doc.getText(`file:${currentFileId}`).toString();
+      }
+    }
+    const history = (input.history ?? []).slice(-8);
+
+    const apiKey = config.ai.apiKey;
+    const baseUrl = config.ai.baseUrl;
+    const model = config.ai.model;
+
+    if (!apiKey) {
+      response.json({
+        reply: [
+          "AI chat is unconfigured.",
+          "",
+          "Set OPENROUTER_API_KEY (or AI_API_KEY + AI_BASE_URL) in your .env to enable real responses.",
+          "",
+          `Echo: ${message}`,
+          fileName ? `Current file: ${fileName} (${summarizeCode(code)})` : ""
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        model: null,
+        context: { roomId, fileName }
+      });
+      return;
+    }
+
+    try {
+      const systemPrompt = [
+        "You are an AI pair programmer embedded in a collaborative VS Code-like room called Codexa.",
+        "Keep replies concise and practical. Prefer code diffs when explaining changes.",
+        fileName ? `The user is currently editing ${fileName}.` : "",
+        code ? `Current file contents:\n\n${code.slice(0, 4000)}` : ""
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+
+      const upstream = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+          ...(config.ai.siteUrl ? { "HTTP-Referer": config.ai.siteUrl } : {}),
+          ...(config.ai.siteName ? { "X-Title": config.ai.siteName } : {})
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...history.map((m) => ({ role: m.role, content: m.content })),
+            { role: "user", content: message }
+          ],
+          temperature: 0.3,
+          max_tokens: 800
+        })
+      });
+
+      if (!upstream.ok) {
+        const detail = await upstream.text().catch(() => "");
+        response.status(502).json({ error: `Upstream AI error (${upstream.status}): ${detail.slice(0, 200)}` });
+        return;
+      }
+
+      const payload = (await upstream.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      const reply = payload.choices?.[0]?.message?.content ?? "(empty response)";
+      response.json({ reply, model, context: { roomId, fileName } });
+    } catch (error) {
+      response.status(500).json({
+        error: error instanceof Error ? error.message : "AI chat failed."
+      });
+    }
+  })
+);
+
+app.post("/submissions", limiters.submissions, asyncRoute(async (request, response) => {
   const input = submissionCreateSchema.parse(request.body);
   const problem = input.problemSlug ? getProblem(input.problemSlug) : undefined;
+
+  let tests: Array<{ id: string; input: string; expected: string; hidden?: boolean }> = [];
+  if (input.tests && input.tests.length > 0) {
+    tests = input.tests.map((t, idx) => ({
+      id: t.id || `test-${idx + 1}`,
+      input: t.input,
+      expected: t.expected,
+      hidden: Boolean(t.hidden)
+    }));
+  } else if (problem) {
+    tests = problem.tests;
+  } else if (input.stdin) {
+    tests = [{ id: "custom", input: input.stdin, expected: "", hidden: false }];
+  }
 
   const job = await submissionsQueue.add(
     "submission",
     {
       ...input,
-      tests: input.mode === "submit" && problem ? problem.tests : input.stdin ? [{ id: "custom", input: input.stdin, expected: "", hidden: false }] : problem?.tests.slice(0, 2)
+      tests
     },
     {
       removeOnComplete: 100,
@@ -415,7 +909,7 @@ app.post("/submissions", async (request, response) => {
     await prisma.submission
       .create({
         data: {
-          product: input.product.toUpperCase() as never,
+          product: productToPrisma(input.product) as never,
           problem: problem ? { connect: { slug: problem.slug } } : undefined,
           room: input.roomId ? { connect: { id: input.roomId } } : undefined,
           language: input.language.toUpperCase() as never,
@@ -439,7 +933,7 @@ app.post("/submissions", async (request, response) => {
       error: error instanceof Error ? error.message : "Executor timed out"
     });
   }
-});
+}));
 
 function roomStatePayload(roomId: string) {
   const state = roomStates.get(roomId);
@@ -683,6 +1177,130 @@ function removeSocketAwareness(socketId: string, roomId: string) {
   state.socketClients.delete(socketId);
 }
 
+function snapshotBattle(state: RoomBattleState): BattleState {
+  const snapshot: BattleState = {
+    phase: state.phase,
+    durationMs: state.durationMs,
+    participants: Array.from(state.participants.values()),
+    revealCode: state.revealCode
+  };
+  if (state.problemSlug) snapshot.problemSlug = state.problemSlug;
+  if (state.startedAt !== undefined) snapshot.startedAt = state.startedAt;
+  if (state.endsAt !== undefined) snapshot.endsAt = state.endsAt;
+  if (state.countdownEndsAt !== undefined) snapshot.countdownEndsAt = state.countdownEndsAt;
+  if (state.hostSocketId) snapshot.hostSocketId = state.hostSocketId;
+  return snapshot;
+}
+
+function emitBattleState(roomId: string) {
+  const state = roomBattles.get(roomId);
+  if (!state) return;
+  io.to(roomId).emit("battle:state", snapshotBattle(state));
+}
+
+function ensureBattle(roomId: string): RoomBattleState {
+  const existing = roomBattles.get(roomId);
+  if (existing) return existing;
+  const state: RoomBattleState = {
+    phase: "idle",
+    durationMs: DEFAULT_BATTLE_DURATION_MS,
+    participants: new Map(),
+    excluded: new Set(),
+    revealCode: false
+  };
+  roomBattles.set(roomId, state);
+  return state;
+}
+
+function teardownBattleTimers(state: RoomBattleState) {
+  if (state.tickInterval) clearInterval(state.tickInterval);
+  if (state.endTimeout) clearTimeout(state.endTimeout);
+  if (state.countdownTimeout) clearTimeout(state.countdownTimeout);
+  state.tickInterval = undefined;
+  state.endTimeout = undefined;
+  state.countdownTimeout = undefined;
+}
+
+function endBattle(roomId: string, reason: "timer" | "host" | "system") {
+  const state = roomBattles.get(roomId);
+  if (!state) return;
+  if (state.phase === "ended" || state.phase === "idle") return;
+  teardownBattleTimers(state);
+  state.phase = "ended";
+  state.endsAt = Date.now();
+  for (const participant of state.participants.values()) {
+    if (participant.status !== "submitted" && participant.status !== "disconnected") {
+      participant.status = "submitted";
+    }
+  }
+  emitBattleState(roomId);
+  io.to(roomId).emit("battle:ended", { reason });
+}
+
+function startBattleTimers(roomId: string) {
+  const state = roomBattles.get(roomId);
+  if (!state || !state.endsAt) return;
+  teardownBattleTimers(state);
+  state.tickInterval = setInterval(() => {
+    const battle = roomBattles.get(roomId);
+    if (!battle || battle.phase !== "running") return;
+    io.to(roomId).emit("battle:tick", {
+      now: Date.now(),
+      endsAt: battle.endsAt,
+      participants: Array.from(battle.participants.values())
+    });
+  }, 1000);
+  state.endTimeout = setTimeout(() => endBattle(roomId, "timer"), state.endsAt - Date.now());
+}
+
+function syncBattleParticipants(roomId: string) {
+  const room = roomStates.get(roomId);
+  const battle = roomBattles.get(roomId);
+  if (!room || !battle) return;
+  const activeIds = new Set(room.activeUsers.keys());
+
+  for (const [socketId, user] of room.activeUsers.entries()) {
+    if (battle.excluded.has(socketId)) continue;
+    if (battle.phase === "running" || battle.phase === "countdown") {
+      if (!battle.participants.has(socketId)) continue;
+      const existing = battle.participants.get(socketId)!;
+      existing.name = user.name;
+      existing.role = user.role;
+      if (existing.status === "disconnected") existing.status = "joined";
+    } else if (battle.phase === "lobby") {
+      const existing = battle.participants.get(socketId);
+      if (existing) {
+        existing.name = user.name;
+        existing.role = user.role;
+      } else {
+        battle.participants.set(socketId, {
+          socketId,
+          name: user.name,
+          role: user.role,
+          status: "joined"
+        });
+      }
+    } else if (battle.phase === "ended" || battle.phase === "idle") {
+      // nothing — ended is frozen; idle has no participants
+    }
+  }
+
+  for (const [socketId, participant] of Array.from(battle.participants.entries())) {
+    if (!activeIds.has(socketId)) {
+      if (battle.phase === "lobby") {
+        battle.participants.delete(socketId);
+      } else if (battle.phase === "running" || battle.phase === "countdown") {
+        participant.status = "disconnected";
+      }
+    }
+  }
+
+  if (!battle.hostSocketId || !activeIds.has(battle.hostSocketId)) {
+    const nextHost = Array.from(room.activeUsers.values()).find((u) => u.role === "admin");
+    battle.hostSocketId = nextHost?.socketId;
+  }
+}
+
 io.on("connection", (socket) => {
   socket.on("room:join", async ({ roomId, product, name, email }: { roomId: string; product: ProductKind; name: string; email?: string }) => {
     const displayName = String(name ?? "").trim();
@@ -737,6 +1355,9 @@ io.on("connection", (socket) => {
     if (state.excalidrawScene) {
       socket.emit("excalidraw:update", state.excalidrawScene);
     }
+    if (state.systemDesignScene) {
+      socket.emit("system-design:update", { scene: state.systemDesignScene });
+    }
 
     if (state.product === "collaborative") {
       const collab = ensureCollabState(roomId);
@@ -750,6 +1371,22 @@ io.on("connection", (socket) => {
         socket.emit("yjs:awareness:update", {
           update: awarenessProtocol.encodeAwarenessUpdate(collab.awareness, awarenessClients)
         });
+      }
+    }
+
+    if (state.product === "arena") {
+      const battle = roomBattles.get(roomId);
+      if (battle && battle.phase !== "idle") {
+        if (!battle.excluded.has(socket.id)) {
+          if (battle.phase === "lobby") {
+            syncBattleParticipants(roomId);
+          } else if (battle.participants.has(socket.id)) {
+            const existing = battle.participants.get(socket.id)!;
+            existing.status = existing.status === "disconnected" ? "coding" : existing.status;
+          }
+        }
+        socket.emit("battle:state", snapshotBattle(battle));
+        emitBattleState(roomId);
       }
     }
   });
@@ -841,6 +1478,48 @@ io.on("connection", (socket) => {
     }
   );
 
+  socket.on(
+    "collab:search",
+    ({ roomId, query, caseSensitive }: { roomId: string; query: string; caseSensitive?: boolean }) => {
+      const state = roomCollabStates.get(roomId);
+      if (!state || !getRoomUser(roomId, socket.id)) {
+        socket.emit("collab:search:result", { query, matches: [] });
+        return;
+      }
+      const trimmed = query.trim();
+      if (!trimmed) {
+        socket.emit("collab:search:result", { query, matches: [] });
+        return;
+      }
+      const needle = caseSensitive ? trimmed : trimmed.toLowerCase();
+      const metas = readFileMetas(state.doc);
+      type Match = { fileId: string; fileName: string; lineNumber: number; column: number; preview: string };
+      const matches: Match[] = [];
+      let total = 0;
+      for (const meta of metas) {
+        const content = state.doc.getText(`file:${meta.id}`).toString();
+        const lines = content.split(/\r?\n/);
+        for (let i = 0; i < lines.length; i += 1) {
+          const line = lines[i] ?? "";
+          const hay = caseSensitive ? line : line.toLowerCase();
+          const idx = hay.indexOf(needle);
+          if (idx === -1) continue;
+          total += 1;
+          if (matches.length < 200) {
+            matches.push({
+              fileId: meta.id,
+              fileName: meta.name,
+              lineNumber: i + 1,
+              column: idx + 1,
+              preview: line.length > 200 ? `${line.slice(0, 100)}…${line.slice(idx)}` : line
+            });
+          }
+        }
+      }
+      socket.emit("collab:search:result", { query, matches, total });
+    }
+  );
+
   socket.on("file:lock", ({ roomId, fileId }: { roomId: string; fileId: string }) => {
     const state = roomCollabStates.get(roomId);
     const user = getRoomUser(roomId, socket.id);
@@ -857,6 +1536,195 @@ io.on("connection", (socket) => {
     meta.set(fileId, { ...current, lockedBy: user.name });
     io.to(roomId).emit("file:list", { files: readFileMetas(state.doc) });
   });
+
+  socket.on("battle:setup", ({ roomId }: { roomId: string }) => {
+    if (!isRoomAdmin(roomId, socket.id)) {
+      socket.emit("room:error", { message: "Only the room admin can start Battle Mode." });
+      return;
+    }
+    const room = roomStates.get(roomId);
+    if (!room || room.product !== "arena") {
+      socket.emit("room:error", { message: "Battle Mode is only available in Arena rooms." });
+      return;
+    }
+    const battle = ensureBattle(roomId);
+    if (battle.phase === "running" || battle.phase === "countdown") return;
+    battle.phase = "lobby";
+    battle.hostSocketId = socket.id;
+    battle.revealCode = false;
+    battle.excluded.clear();
+    battle.participants.clear();
+    syncBattleParticipants(roomId);
+    emitBattleState(roomId);
+  });
+
+  socket.on("battle:cancel", ({ roomId }: { roomId: string }) => {
+    if (!isRoomAdmin(roomId, socket.id)) return;
+    const battle = roomBattles.get(roomId);
+    if (!battle) return;
+    if (battle.phase !== "lobby" && battle.phase !== "ended") {
+      socket.emit("room:error", { message: "Use End Battle to stop a running battle." });
+      return;
+    }
+    teardownBattleTimers(battle);
+    battle.phase = "idle";
+    battle.participants.clear();
+    battle.excluded.clear();
+    battle.problemSlug = undefined;
+    battle.startedAt = undefined;
+    battle.endsAt = undefined;
+    battle.countdownEndsAt = undefined;
+    emitBattleState(roomId);
+  });
+
+  socket.on(
+    "battle:select-problem",
+    ({ roomId, slug }: { roomId: string; slug: string }) => {
+      if (!isRoomAdmin(roomId, socket.id)) return;
+      const battle = roomBattles.get(roomId);
+      if (!battle || battle.phase !== "lobby") return;
+      const problem = getProblem(slug);
+      if (!problem) return;
+      battle.problemSlug = slug;
+      emitBattleState(roomId);
+    }
+  );
+
+  socket.on(
+    "battle:set-duration",
+    ({ roomId, durationMs }: { roomId: string; durationMs: number }) => {
+      if (!isRoomAdmin(roomId, socket.id)) return;
+      const battle = roomBattles.get(roomId);
+      if (!battle || battle.phase !== "lobby") return;
+      const ms = Math.max(60_000, Math.min(4 * 60 * 60 * 1000, Math.floor(durationMs)));
+      battle.durationMs = ms;
+      emitBattleState(roomId);
+    }
+  );
+
+  socket.on("battle:kick", ({ roomId, targetSocketId }: { roomId: string; targetSocketId: string }) => {
+    if (!isRoomAdmin(roomId, socket.id)) return;
+    const battle = roomBattles.get(roomId);
+    if (!battle || battle.phase !== "lobby") return;
+    if (targetSocketId === battle.hostSocketId) return;
+    battle.excluded.add(targetSocketId);
+    battle.participants.delete(targetSocketId);
+    io.to(targetSocketId).emit("battle:kicked", { roomId });
+    emitBattleState(roomId);
+  });
+
+  socket.on("battle:unkick", ({ roomId, targetSocketId }: { roomId: string; targetSocketId: string }) => {
+    if (!isRoomAdmin(roomId, socket.id)) return;
+    const battle = roomBattles.get(roomId);
+    if (!battle || battle.phase !== "lobby") return;
+    battle.excluded.delete(targetSocketId);
+    syncBattleParticipants(roomId);
+    emitBattleState(roomId);
+  });
+
+  socket.on("battle:start", ({ roomId }: { roomId: string }) => {
+    if (!isRoomAdmin(roomId, socket.id)) return;
+    const battle = roomBattles.get(roomId);
+    if (!battle || battle.phase !== "lobby") return;
+    if (!battle.problemSlug) {
+      socket.emit("room:error", { message: "Select a problem before starting." });
+      return;
+    }
+    if (battle.participants.size === 0) {
+      socket.emit("room:error", { message: "Need at least one participant to start." });
+      return;
+    }
+    const now = Date.now();
+    battle.phase = "countdown";
+    battle.countdownEndsAt = now + COUNTDOWN_MS;
+    battle.startedAt = now + COUNTDOWN_MS;
+    battle.endsAt = battle.startedAt + battle.durationMs;
+    for (const participant of battle.participants.values()) {
+      participant.status = "coding";
+      participant.result = undefined;
+    }
+    emitBattleState(roomId);
+    battle.countdownTimeout = setTimeout(() => {
+      const live = roomBattles.get(roomId);
+      if (!live || live.phase !== "countdown") return;
+      live.phase = "running";
+      emitBattleState(roomId);
+      startBattleTimers(roomId);
+    }, COUNTDOWN_MS);
+  });
+
+  socket.on("battle:end", ({ roomId }: { roomId: string }) => {
+    if (!isRoomAdmin(roomId, socket.id)) return;
+    endBattle(roomId, "host");
+  });
+
+  socket.on(
+    "battle:reveal",
+    ({ roomId, reveal }: { roomId: string; reveal: boolean }) => {
+      if (!isRoomAdmin(roomId, socket.id)) return;
+      const battle = roomBattles.get(roomId);
+      if (!battle || battle.phase !== "ended") return;
+      battle.revealCode = Boolean(reveal);
+      emitBattleState(roomId);
+    }
+  );
+
+  socket.on(
+    "battle:status",
+    ({ roomId, status }: { roomId: string; status: BattleParticipantStatus }) => {
+      const battle = roomBattles.get(roomId);
+      if (!battle) return;
+      const participant = battle.participants.get(socket.id);
+      if (!participant) return;
+      if (battle.phase !== "running") return;
+      if (participant.status === "submitted") return;
+      participant.status = status;
+      emitBattleState(roomId);
+    }
+  );
+
+  socket.on(
+    "battle:submit",
+    ({
+      roomId,
+      passed,
+      total,
+      status,
+      runtimeMs
+    }: {
+      roomId: string;
+      passed: number;
+      total: number;
+      status: string;
+      runtimeMs: number;
+    }) => {
+      const battle = roomBattles.get(roomId);
+      if (!battle) return;
+      const participant = battle.participants.get(socket.id);
+      if (!participant) return;
+      if (battle.phase !== "running") return;
+      const next = {
+        passed,
+        total,
+        status,
+        runtimeMs,
+        submittedAt: new Date().toISOString()
+      };
+      const previous = participant.result;
+      const isBetter =
+        !previous ||
+        passed > previous.passed ||
+        (passed === previous.passed && runtimeMs < previous.runtimeMs);
+      if (isBetter) participant.result = next;
+      participant.status = "submitted";
+      emitBattleState(roomId);
+
+      const allDone = Array.from(battle.participants.values()).every(
+        (p) => p.status === "submitted" || p.status === "disconnected"
+      );
+      if (allDone) endBattle(roomId, "system");
+    }
+  );
 
   socket.on("file:unlock", ({ roomId, fileId }: { roomId: string; fileId: string }) => {
     const state = roomCollabStates.get(roomId);
@@ -908,6 +1776,28 @@ io.on("connection", (socket) => {
     socket.to(roomId).emit("excalidraw:update", state.excalidrawScene);
   });
 
+  socket.on("system-design:update", ({ roomId, scene }: { roomId: string; scene: unknown }) => {
+    const state = roomStates.get(roomId);
+    if (!state || state.product !== "system-design" || !getRoomUser(roomId, socket.id)) return;
+    if (!scene || typeof scene !== "object") return;
+    const nextScene = scene as Partial<SystemDesignScene>;
+    if (!Array.isArray(nextScene.nodes) || !Array.isArray(nextScene.edges)) return;
+
+    state.systemDesignScene = {
+      nodes: nextScene.nodes,
+      edges: nextScene.edges,
+      templateId: typeof nextScene.templateId === "string" ? nextScene.templateId : undefined,
+      templateName: typeof nextScene.templateName === "string" ? nextScene.templateName : undefined,
+      workload: nextScene.workload,
+      simulationRunning: Boolean(nextScene.simulationRunning),
+      chaosEvents: Array.isArray(nextScene.chaosEvents) ? nextScene.chaosEvents : [],
+      notes: typeof nextScene.notes === "string" ? nextScene.notes : "",
+      challenge: nextScene.challenge,
+      updatedAt: typeof nextScene.updatedAt === "number" ? nextScene.updatedAt : Date.now()
+    };
+    socket.to(roomId).emit("system-design:update", { scene: state.systemDesignScene });
+  });
+
   socket.on("room:invite", ({ roomId, email }: { roomId: string; email: string }) => {
     if (!isRoomAdmin(roomId, socket.id)) {
       socket.emit("room:error", { message: "Only the room admin can invite users." });
@@ -944,6 +1834,11 @@ io.on("connection", (socket) => {
     if (!state || !getRoomUser(roomId, socket.id)) return;
 
     state.ended = true;
+    const battle = roomBattles.get(roomId);
+    if (battle) {
+      teardownBattleTimers(battle);
+      roomBattles.delete(roomId);
+    }
     io.to(roomId).emit("room:ended", { roomId });
     for (const socketId of state.activeUsers.keys()) {
       io.sockets.sockets.get(socketId)?.leave(roomId);
@@ -960,7 +1855,29 @@ io.on("connection", (socket) => {
       if (!state) continue;
       state.activeUsers.delete(socket.id);
       promoteNextAdmin(roomId);
+
+      const battle = roomBattles.get(roomId);
+      if (battle) {
+        const participant = battle.participants.get(socket.id);
+        if (participant) {
+          if (battle.phase === "running" || battle.phase === "countdown") {
+            participant.status = "disconnected";
+          } else if (battle.phase === "lobby") {
+            battle.participants.delete(socket.id);
+          }
+        }
+        if (battle.hostSocketId === socket.id) {
+          const nextAdmin = Array.from(state.activeUsers.values()).find((u) => u.role === "admin");
+          battle.hostSocketId = nextAdmin?.socketId;
+        }
+        if (battle.phase !== "idle") emitBattleState(roomId);
+      }
+
       if (state.activeUsers.size === 0) {
+        if (battle) {
+          teardownBattleTimers(battle);
+          roomBattles.delete(roomId);
+        }
         roomStates.delete(roomId);
         roomDocs.delete(roomId);
         tearDownCollabState(roomId);
@@ -971,6 +1888,15 @@ io.on("connection", (socket) => {
   });
 });
 
-server.listen(port, () => {
-  console.log(`API + realtime listening on http://localhost:${port}`);
+// Central error handler — must be the LAST middleware mounted. Sync throws
+// from any route (e.g. ZodError from `.parse()`) and any error forwarded via
+// `next(err)` in asyncRoute() end up here.
+app.use(errorHandler);
+
+server.listen(config.port, () => {
+  // eslint-disable-next-line no-console
+  console.log(
+    `API + realtime listening on http://localhost:${config.port} ` +
+      `[${config.nodeEnv}] cors=${config.corsOrigins.join(",")}`
+  );
 });

@@ -9,7 +9,9 @@ import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate, removeAwareness
 import { MonacoBinding } from "y-monaco";
 import { Button } from "@codexa/ui";
 import type { CollabFileMeta, Language } from "@codexa/types";
-import { FilePlus, X, Pencil, Loader2, Lock, Unlock } from "lucide-react";
+import { ChevronDown, ChevronUp, FilePlus, Loader2, Lock, Play, Unlock, X } from "lucide-react";
+import { TerminalOutput, type TerminalEntry } from "@/components/terminal-output";
+import type { Submission } from "@codexa/types";
 
 const MonacoEditor = dynamic(() => import("@monaco-editor/react").then((mod) => mod.default), { ssr: false });
 
@@ -56,7 +58,6 @@ function languageFromName(name: string): Language {
   const ext = name.slice(idx + 1).toLowerCase();
   return extensionToLanguage[ext] ?? "javascript";
 }
-
 function colorFromString(value: string) {
   let hash = 0;
   for (let i = 0; i < value.length; i += 1) {
@@ -92,10 +93,12 @@ type Props = {
   roomId: string;
   displayName: string;
   joined: boolean;
-  onActiveFileChange?: (file: { id: string; name: string } | null) => void;
+  onActiveFileChange?: (file: { id: string; name: string; language: Language; lockedBy?: string } | null) => void;
+  onFilesChange?: (files: CollabFileMeta[]) => void;
+  openFileRequest?: { id: string; nonce: number } | null;
 };
 
-export function CollaborativeEditor({ socket, roomId, displayName, joined, onActiveFileChange }: Props) {
+export function CollaborativeEditor({ socket, roomId, displayName, joined, onActiveFileChange, onFilesChange, openFileRequest }: Props) {
   const docRef = useRef<Y.Doc | null>(null);
   const awarenessRef = useRef<Awareness | null>(null);
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
@@ -110,6 +113,11 @@ export function CollaborativeEditor({ socket, roomId, displayName, joined, onAct
   const [renameValue, setRenameValue] = useState("");
   const [adding, setAdding] = useState(false);
   const [addValue, setAddValue] = useState("");
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [terminalEntries, setTerminalEntries] = useState<TerminalEntry[]>([]);
+  const [terminalLoading, setTerminalLoading] = useState(false);
+  const [terminalStdin, setTerminalStdin] = useState("");
+  const [lastSubmission, setLastSubmission] = useState<Submission | null>(null);
 
   const userColor = useMemo(() => colorFromString(displayName || socket.id || "anon"), [displayName, socket.id]);
 
@@ -236,8 +244,27 @@ export function CollaborativeEditor({ socket, roomId, displayName, joined, onAct
 
   useEffect(() => {
     if (!onActiveFileChange) return;
-    onActiveFileChange(activeFile ? { id: activeFile.id, name: activeFile.name } : null);
+    if (!activeFile) {
+      onActiveFileChange(null);
+      return;
+    }
+    const payload: { id: string; name: string; language: Language; lockedBy?: string } = {
+      id: activeFile.id,
+      name: activeFile.name,
+      language: activeFile.language
+    };
+    if (activeFile.lockedBy) payload.lockedBy = activeFile.lockedBy;
+    onActiveFileChange(payload);
   }, [activeFile, onActiveFileChange]);
+
+  useEffect(() => {
+    onFilesChange?.(files);
+  }, [files, onFilesChange]);
+
+  useEffect(() => {
+    if (!openFileRequest) return;
+    setActiveFileId(openFileRequest.id);
+  }, [openFileRequest]);
 
   const handleEditorMount = useCallback(
     (instance: editor.IStandaloneCodeEditor, monaco: typeof import("monaco-editor")) => {
@@ -290,23 +317,50 @@ export function CollaborativeEditor({ socket, roomId, displayName, joined, onAct
 
   // Track remote users (with clientID) for both the live-presence chip row
   // and the dynamic style tag that colors the Monaco selection/cursor decorations.
-  const [remoteUsers, setRemoteUsers] = useState<Array<{ clientId: number; name: string; color: string; fileId?: string }>>([]);
+  type RemotePresence = { clientId: number; name: string; color: string; fileId?: string; status: "typing" | "idle" };
+  const [remoteUsers, setRemoteUsers] = useState<RemotePresence[]>([]);
   useEffect(() => {
     const awareness = awarenessRef.current;
     if (!awareness) return;
     const refresh = () => {
-      const others: Array<{ clientId: number; name: string; color: string; fileId?: string }> = [];
+      const others: RemotePresence[] = [];
       awareness.getStates().forEach((state, clientId) => {
         if (clientId === awareness.clientID) return;
-        const user = (state as { user?: { name?: string; color?: string }; fileId?: string }).user;
+        const user = (state as { user?: { name?: string; color?: string }; fileId?: string; status?: "typing" | "idle" }).user;
         if (!user?.name) return;
-        others.push({ clientId, name: user.name, color: user.color ?? "#888", fileId: (state as { fileId?: string }).fileId });
+        const status = (state as { status?: "typing" | "idle" }).status === "typing" ? "typing" : "idle";
+        others.push({ clientId, name: user.name, color: user.color ?? "#888", fileId: (state as { fileId?: string }).fileId, status });
       });
       setRemoteUsers(others);
     };
     awareness.on("change", refresh);
     refresh();
     return () => awareness.off("change", refresh);
+  }, [hydrated]);
+
+  // Mark myself as typing when content changes, debounced back to idle.
+  const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    const doc = docRef.current;
+    const awareness = awarenessRef.current;
+    if (!doc || !awareness) return;
+    const onUpdate = (_update: Uint8Array, origin: unknown) => {
+      if (origin === "remote") return;
+      const local = awareness.getLocalState() ?? {};
+      if ((local as { status?: string }).status !== "typing") {
+        awareness.setLocalState({ ...local, status: "typing" });
+      }
+      if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+      typingTimerRef.current = setTimeout(() => {
+        const current = awareness.getLocalState() ?? {};
+        awareness.setLocalState({ ...current, status: "idle" });
+      }, 1500);
+    };
+    doc.on("update", onUpdate);
+    return () => {
+      doc.off("update", onUpdate);
+      if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+    };
   }, [hydrated]);
 
   // Inject CSS so y-monaco's per-clientID decorations show each user's color and name.
@@ -351,6 +405,80 @@ export function CollaborativeEditor({ socket, roomId, displayName, joined, onAct
     const model = modelsRef.current.get(fileId);
     model?.dispose();
     modelsRef.current.delete(fileId);
+  }
+
+  async function runActiveFile() {
+    const doc = docRef.current;
+    if (!doc || !activeFile) return;
+    const code = doc.getText(`file:${activeFile.id}`).toString();
+    if (!code.trim()) {
+      setTerminalEntries([
+        {
+          id: "no-code",
+          label: "no-code",
+          command: `run ${activeFile.name}`,
+          status: "INFO",
+          stderr: "File is empty."
+        }
+      ]);
+      setTerminalOpen(true);
+      return;
+    }
+    setTerminalOpen(true);
+    setTerminalLoading(true);
+    setTerminalEntries([
+      {
+        id: "running",
+        label: "running",
+        command: `${activeFile.language} ${activeFile.name}`,
+        status: "RUNNING"
+      }
+    ]);
+    try {
+      const res = await fetch("/api/submissions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          product: "collaborative",
+          language: activeFile.language,
+          code,
+          mode: "run",
+          tests: [
+            {
+              id: activeFile.name,
+              input: terminalStdin,
+              expected: ""
+            }
+          ]
+        })
+      });
+      const payload = (await res.json()) as Submission;
+      setLastSubmission(payload);
+      const result = payload.results?.[0];
+      const entry: TerminalEntry = {
+        id: result?.testCaseId ?? "run",
+        label: "run",
+        command: `${activeFile.language} ${activeFile.name}`,
+        status: result?.status ?? payload.status ?? "SYSTEM_ERROR",
+        runtimeMs: result?.runtimeMs ?? payload.runtimeMs
+      };
+      if (terminalStdin) entry.stdin = terminalStdin;
+      if (result?.stdout) entry.stdout = result.stdout;
+      if (result?.stderr) entry.stderr = result.stderr;
+      setTerminalEntries([entry]);
+    } catch (error) {
+      setTerminalEntries([
+        {
+          id: "error",
+          label: "error",
+          command: `${activeFile.language} ${activeFile.name}`,
+          status: "SYSTEM_ERROR",
+          stderr: error instanceof Error ? error.message : "Run failed"
+        }
+      ]);
+    } finally {
+      setTerminalLoading(false);
+    }
   }
 
   function submitRename(fileId: string) {
@@ -468,6 +596,18 @@ export function CollaborativeEditor({ socket, roomId, displayName, joined, onAct
         )}
 
         <div className="ml-auto flex items-center gap-2">
+          {activeFile && (
+            <button
+              type="button"
+              onClick={() => void runActiveFile()}
+              disabled={terminalLoading}
+              className="flex h-7 items-center gap-1 rounded-md border border-signal-cyan/30 bg-signal-cyan/10 px-2 text-xs font-bold text-signal-cyan transition hover:bg-signal-cyan/20 disabled:opacity-40"
+              title="Run the active file"
+            >
+              {terminalLoading ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
+              Run
+            </button>
+          )}
           {activeFile && !activeFile.lockedBy && (
             <button
               type="button"
@@ -521,6 +661,51 @@ export function CollaborativeEditor({ socket, roomId, displayName, joined, onAct
         />
       </div>
 
+      <div className={`shrink-0 ${terminalOpen ? "h-56" : "h-7"} border-t border-white/10 transition-all`}>
+        {terminalOpen ? (
+          <TerminalOutput
+            title={`TERMINAL${activeFile ? ` · ${activeFile.name}` : ""}`}
+            entries={terminalEntries}
+            loading={terminalLoading}
+            onClear={() => setTerminalEntries([])}
+            footer={
+              <div className="flex items-center gap-2 text-[11px] text-white/56">
+                <span className="text-white/40">stdin</span>
+                <input
+                  className="h-6 flex-1 rounded border border-white/10 bg-ink-950 px-2 text-[11px] text-white outline-none placeholder:text-white/30 focus:border-signal-cyan"
+                  placeholder="(empty)"
+                  value={terminalStdin}
+                  onChange={(event) => setTerminalStdin(event.target.value)}
+                />
+                {lastSubmission && (
+                  <span className="text-white/40">{lastSubmission.runtimeMs}ms</span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setTerminalOpen(false)}
+                  className="flex size-5 items-center justify-center rounded text-white/40 hover:bg-white/10 hover:text-white"
+                  title="Collapse terminal"
+                >
+                  <ChevronDown size={12} />
+                </button>
+              </div>
+            }
+          />
+        ) : (
+          <button
+            type="button"
+            onClick={() => setTerminalOpen(true)}
+            className="flex h-full w-full items-center gap-2 bg-ink-950 px-3 text-[10px] font-semibold uppercase tracking-wider text-white/56 transition hover:text-white"
+          >
+            <ChevronUp size={12} />
+            Terminal
+            {terminalEntries.length > 0 && (
+              <span className="ml-auto text-[10px] text-white/40">{terminalEntries.length} run{terminalEntries.length === 1 ? "" : "s"}</span>
+            )}
+          </button>
+        )}
+      </div>
+
       {remoteUsers.length > 0 && (
         <div className="flex flex-wrap items-center gap-2 border-t border-white/10 bg-ink-950/70 px-3 py-1.5 text-xs text-white/60">
           <span className="text-white/40">Live:</span>
@@ -528,9 +713,16 @@ export function CollaborativeEditor({ socket, roomId, displayName, joined, onAct
             <span
               key={`${user.name}-${idx}`}
               className="inline-flex items-center gap-1 rounded-full border border-white/10 px-2 py-0.5"
+              title={user.status === "typing" ? `${user.name} is typing` : `${user.name} is idle`}
             >
-              <span className="size-1.5 rounded-full" style={{ background: user.color }} />
+              <span
+                className={`size-1.5 rounded-full ${user.status === "typing" ? "animate-pulse" : ""}`}
+                style={{ background: user.color }}
+              />
               {user.name}
+              {user.status === "typing" && (
+                <span className="ml-0.5 text-[10px] uppercase tracking-wider text-signal-cyan">typing</span>
+              )}
             </span>
           ))}
         </div>
@@ -538,6 +730,3 @@ export function CollaborativeEditor({ socket, roomId, displayName, joined, onAct
     </div>
   );
 }
-
-// Suppress unused import warning while keeping option for rename UI
-void Pencil;

@@ -5,8 +5,26 @@ import GitHub from "next-auth/providers/github";
 import { PrismaAdapter } from "@auth/prisma-adapter";
 import { prisma } from "@codexa/db";
 
+const isProd = process.env.NODE_ENV === "production";
+
+// In production we require AUTH_SECRET to be set so JWT signing is deterministic
+// across replicas. Fail fast on boot rather than silently issuing unverifiable
+// tokens.
+if (isProd && !process.env.AUTH_SECRET && !process.env.NEXTAUTH_SECRET) {
+  throw new Error(
+    "AUTH_SECRET must be set in production (generate with `openssl rand -base64 32`)."
+  );
+}
+
 export const { handlers, auth, signIn, signOut } = NextAuth({
   adapter: PrismaAdapter(prisma),
+  // trustHost is required when running behind a reverse proxy / load balancer
+  // (Vercel, Fly, Render, K8s ingress). NextAuth otherwise rejects callback URLs
+  // it can't verify against NEXTAUTH_URL.
+  trustHost: true,
+  // Lock cookies to the configured URL in production. NextAuth will derive
+  // sameSite/secure flags automatically when NEXTAUTH_URL is https.
+  useSecureCookies: isProd,
   session: {
     strategy: "jwt"
   },
@@ -22,8 +40,13 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         password: { label: "Password", type: "password" }
       },
       async authorize(credentials) {
-        const email = String(credentials?.email ?? "");
+        const email = String(credentials?.email ?? "").trim().toLowerCase();
         const password = String(credentials?.password ?? "");
+
+        // Cheap input gate before touching the DB. Same shape returns we'd use
+        // on bad creds — don't leak which field was wrong.
+        if (!email || !password || password.length > 256) return null;
+
         const user = await prisma.user.findUnique({ where: { email } });
 
         if (!user?.passwordHash) {
